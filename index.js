@@ -251,6 +251,36 @@ app.get("/lap_intervals", async (req, res) => {
 });
 
 
+app.get("/session_result", async (req, res) => {
+  const { session_key, driver_number } = req.query;
+
+  // 1. Enforce the required session_key parameter
+  if (!session_key) {
+    return res.status(400).json({ 
+      error: "The /session_result endpoint requires a 'session_key' parameter to filter the results. Please specify a session ID." 
+    });
+  }
+
+  // 2. Build the query object
+  // Since we are handling the request manually, we pass all query parameters (including driver_number) 
+  // directly to OpenF1's /v1/session_result endpoint for native filtering.
+  const query = {
+    session_key: session_key,
+    ...(driver_number && { driver_number: driver_number }) // Conditionally add driver_number
+  };
+  
+  try {
+    const data = await fetchFromOpenF1("/v1/session_result", query);
+    
+    // 3. Return the filtered data
+    res.json(data);
+
+  } catch (err) {
+    console.error("OpenF1 API error in /session_result:", err.message);
+    res.status(500).json({ error: "Failed to fetch session results from OpenF1" });
+  }
+});
+
 
 
 // Core REST endpoints (Use the generic handler for all others)
@@ -258,14 +288,14 @@ app.get("/lap_intervals", async (req, res) => {
 // app.get("/car_data", createRoute("/v1/car_data")); done
 // app.get("/intervals", createRoute("/v1/intervals")); not done yet
 app.get("/laps", createRoute("/v1/laps"));  //done
-app.get("/location", createRoute("/v1/location"));
+
 app.get("/meetings", createRoute("/v1/meetings"));
 app.get("/overtakes", createRoute("/v1/overtakes"));
-app.get("/pit", createRoute("/v1/pit"));
+app.get("/pit", createRoute("/v1/pit"));//ignored
 app.get("/position", createRoute("/v1/position"));
 app.get("/race_control", createRoute("/v1/race_control"));
 app.get("/sessions", createRoute("/v1/sessions"));
-app.get("/session_result", createRoute("/v1/session_result"));
+// app.get("/session_result", createRoute("/v1/session_result"));
 app.get("/starting_grid", createRoute("/v1/starting_grid"));
 app.get("/stints", createRoute("/v1/stints"));
 app.get("/team_radio", createRoute("/v1/team_radio"));
