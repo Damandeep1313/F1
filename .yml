@@ -1,0 +1,277 @@
+openapi: 3.0.0
+info:
+  title: F1 Combined API
+  version: 1.0.0
+  description: Unified OpenF1 Proxy + Chart Generator
+
+servers:
+  - url: http://localhost:3000
+
+paths:
+
+  ###########################
+  # UNIVERSAL F1 INFO
+  ###########################
+  /f1_info:
+    get:
+      summary: Unified endpoint for drivers, sessions, and meetings
+      operationId: getF1Info
+      parameters:
+        - in: query
+          name: type
+          required: true
+          description: Type of info to fetch
+          schema:
+            type: string
+            enum: [drivers, sessions, meetings]
+        - in: query
+          name: name
+          description: Filter by driver or meeting name
+          schema:
+            type: string
+        - in: query
+          name: year
+          description: Filter by year
+          schema:
+            type: integer
+        - in: query
+          name: country_name
+          description: Filter by country name
+          schema:
+            type: string
+        - in: query
+          name: session_name
+          description: Filter by session type
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+
+  ###########################
+  # BASIC PROXY ENDPOINTS
+  ###########################
+  /drivers:
+    get:
+      summary: Get latest driver info
+      operationId: getDrivers
+      parameters:
+        - in: query
+          name: name
+          description: Filter drivers by name
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+
+  /car_data:
+    get:
+      summary: Get telemetry / car data
+      operationId: getCarData
+      parameters:
+        - in: query
+          name: session_key
+          required: true
+          description: Unique session key
+          schema:
+            type: integer
+        - in: query
+          name: driver_number
+          required: true
+          description: Driver number
+          schema:
+            type: integer
+        - in: query
+          name: lap_number
+          description: Filter by lap number
+          schema:
+            type: integer
+        - in: query
+          name: date
+          description: Filter telemetry by timestamp
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+
+  /lap_intervals:
+    get:
+      summary: Get lap interval data around lap end
+      operationId: getLapIntervals
+      parameters:
+        - in: query
+          name: session_key
+          required: true
+          description: Unique session key
+          schema:
+            type: integer
+        - in: query
+          name: driver_number
+          required: true
+          description: Driver number
+          schema:
+            type: integer
+        - in: query
+          name: lap_number
+          required: true
+          description: Lap number
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: OK
+
+  /session_result:
+    get:
+      summary: Result for a session or driver
+      operationId: getSessionResult
+      parameters:
+        - in: query
+          name: session_key
+          required: true
+          description: Session key to fetch results for
+          schema:
+            type: integer
+        - in: query
+          name: driver_number
+          description: Filter by driver number
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: OK
+
+  ###########################
+  # GENERIC OPENF1 ROUTES
+  ###########################
+  /laps:
+    get:
+      summary: Proxy for laps endpoint
+      operationId: getLaps
+      responses:
+        '200':
+          description: OK
+
+  /meetings:
+    get:
+      summary: Proxy for meetings
+      operationId: getMeetings
+      responses:
+        '200':
+          description: OK
+
+  /overtakes:
+    get:
+      summary: Proxy for overtakes
+      operationId: getOvertakes
+      responses:
+        '200':
+          description: OK
+
+  /pit:
+    get:
+      summary: Proxy for pit data
+      operationId: getPitData
+      responses:
+        '200':
+          description: OK
+
+  /position:
+    get:
+      summary: Proxy for live position
+      operationId: getPosition
+      responses:
+        '200':
+          description: OK
+
+  /race_control:
+    get:
+      summary: Proxy for race control messages
+      operationId: getRaceControl
+      responses:
+        '200':
+          description: OK
+
+  /sessions:
+    get:
+      summary: Proxy for sessions
+      operationId: getSessions
+      responses:
+        '200':
+          description: OK
+
+  /starting_grid:
+    get:
+      summary: Proxy for starting grid
+      operationId: getStartingGrid
+      responses:
+        '200':
+          description: OK
+
+  /stints:
+    get:
+      summary: Proxy for stints
+      operationId: getStints
+      responses:
+        '200':
+          description: OK
+
+  /team_radio:
+    get:
+      summary: Proxy for team radio messages
+      operationId: getTeamRadio
+      responses:
+        '200':
+          description: OK
+
+  /weather:
+    get:
+      summary: Proxy for weather data
+      operationId: getWeather
+      responses:
+        '200':
+          description: OK
+
+  ###########################
+  # CHART GENERATION ENDPOINTS
+  ###########################
+  /fastest_lap_summary:
+    post:
+      summary: Get fastest lap summary for a session or driver
+      operationId: getFastestLapSummary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                year: { type: integer, description: Race year }
+                gp: { type: string, description: Grand Prix name }
+                session_type: { type: string, description: Session type }
+                driver: { type: string, description: Driver name }
+      responses:
+        '200':
+          description: Fastest lap summary
+
+  /telemetry_chart:
+    post:
+      summary: Generates speed trace chart and uploads to Cloudinary
+      operationId: generateTelemetryChart
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                year: { type: integer, description: Race year }
+                gp: { type: string, description: Grand Prix name }
+                session_type: { type: string, description: Session type }
+                driver: { type: string, description: Driver name }
+                lap_number: { type: integer, description: Lap number }
+      responses:
+        '200':
+          description: Chart URL
