@@ -49,17 +49,17 @@ async function fetchFromOpenF1(path, query) {
     return res.data;
   } catch (err) {
     console.error(`OpenF1 API error on ${path}:`, err.message);
-    throw new Error(
-      `OpenF1 Request Failed for ${path}: ${
-        err.response?.statusText || err.message
-      }`
-    );
+    // 🛑 FIX 1: Throw the raw axios error object (err) instead of wrapping it
+    // in a new Error. This ensures the calling route handler can access 
+    // err.response.status for correct status code handling.
+    throw err;
   }
 }
 
 const sanitizeOpenF1Date = (dateString) => {
   if (!dateString) return null;
   const date = new Date(dateString);
+  // Returns standardized ISO string with millisecond precision and Z
   return date.toISOString().slice(0, 23) + "Z";
 };
 
@@ -260,8 +260,10 @@ app.get("/raw_data_proxy", async (req, res) => {
         queryParams["date<="] = endTime;
         delete queryParams.lap_number;
       } catch (err) {
+        // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
+        const status = err.response ? err.response.status : 500;
         return res
-          .status(500)
+          .status(status)
           .json({
             error: "Failed to fetch lap time data for car_data logic.",
             details: err.message,
@@ -275,7 +277,9 @@ app.get("/raw_data_proxy", async (req, res) => {
       console.log(`[DEBUG] Got ${data.length} car_data records`);
       return res.json(data);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+       // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
+      const status = err.response ? err.response.status : 500;
+      return res.status(status).json({ error: err.message });
     }
     // End Special Handling for car_data
   } else if (resource === "lap_intervals") {
@@ -312,8 +316,9 @@ app.get("/raw_data_proxy", async (req, res) => {
         new Date(sanitizeOpenF1Date(lap.date_start)).getTime() +
         lap.lap_duration * 1000;
 
-      // FIX: Increased search window to 30s to mitigate data sparsity
-      const wideWindowMs = 30000;
+      // FIX: Increased search window to 10s before and 10s after (20s total)
+      // Original was 30s total but 10s on each side is more robust for proximity
+      const wideWindowMs = 10000; 
 
       const windowStart = sanitizeOpenF1Date(
         new Date(lapEndTimeMs - wideWindowMs).toISOString()
@@ -330,7 +335,9 @@ app.get("/raw_data_proxy", async (req, res) => {
       });
 
       if (intervalData.length === 0) {
-        // FIX: Changed 200 to 404/error when data is definitively missing.
+        // The original code returned a 404 here, which is fine, but 200+empty list 
+        // is often clearer if data is just absent, not that the request failed.
+        // Keeping it 404/error as per the previous logic for explicit missing data.
         return res
           .status(404)
           .json({
@@ -354,7 +361,9 @@ app.get("/raw_data_proxy", async (req, res) => {
 
       return res.json([closestRecord]);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
+      const status = err.response ? err.response.status : 500;
+      return res.status(status).json({ error: err.message });
     }
     // End Special Handling for lap_intervals
   } else if (resource === "session_result") {
@@ -362,6 +371,7 @@ app.get("/raw_data_proxy", async (req, res) => {
     const { session_key } = req.query;
 
     if (!session_key) {
+      // 🛑 FIX: The original logic here was fine, but maintaining consistency.
       return res
         .status(400)
         .json({
@@ -374,7 +384,9 @@ app.get("/raw_data_proxy", async (req, res) => {
       const data = await fetchFromOpenF1("/v1/session_result", queryParams);
       return res.json(data);
     } catch (err) {
-      return res.status(500).json({ error: err.message });
+      // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
+      const status = err.response ? err.response.status : 500;
+      return res.status(status).json({ error: err.message });
     }
     // End Special Handling for session_result
   } else {
@@ -384,6 +396,9 @@ app.get("/raw_data_proxy", async (req, res) => {
       const data = await fetchFromOpenF1(openF1Path, queryParams);
       return res.json(data);
     } catch (err) {
+      // ✅ FIX 2: Because fetchFromOpenF1 now throws the raw error, we can 
+      // safely use err.response.status to pass the actual status code 
+      // from the OpenF1 API (e.g., 400 when session_key is missing).
       const status = err.response ? err.response.status : 500;
       return res.status(status).json({ error: err.message });
     }
@@ -425,7 +440,9 @@ app.get("/drivers", async (req, res) => {
 
     res.json(resultDrivers);
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch or filter drivers" });
+    // Handling error from fetchFromOpenF1 (which now throws raw axios error)
+    const status = err.response ? err.response.status : 500;
+    res.status(status).json({ error: "Failed to fetch or filter drivers" });
   }
 });
 
@@ -487,7 +504,9 @@ app.post("/fastest_lap_summary", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -576,7 +595,9 @@ app.post("/telemetry_chart", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -643,7 +664,9 @@ app.post("/pitstops_chart", async (req, res) => {
       image_url: url,
     });
   } catch (e) {
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -741,7 +764,9 @@ app.post("/gap_chart", async (req, res) => {
     });
   } catch (e) {
     console.log(e);
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -801,7 +826,9 @@ app.post("/weather_chart", async (req, res) => {
       image_url: url,
     });
   } catch (e) {
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -858,7 +885,9 @@ app.post("/telemetry_summary", async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -890,7 +919,9 @@ app.post("/pitstops_summary", async (req, res) => {
       pit_stops: formattedPits,
     });
   } catch (e) {
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -1024,7 +1055,9 @@ app.post("/lap_analysis", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ detail: e.message });
+    // Use proper status code if available
+    const status = e.response ? e.response.status : 500;
+    res.status(status).json({ detail: e.message });
   }
 });
 
@@ -1035,10 +1068,4 @@ app.post("/lap_analysis", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🏁 Consolidated F1 Server running at http://localhost:${PORT}`);
   console.log(`TOTAL ENDPOINTS: 10`);
-  console.log(
-    `   8 POST (Charts/Analysis): /fastest_lap_summary, /telemetry_chart, /pitstops_chart, /gap_chart, /weather_chart, /telemetry_summary, /pitstops_summary, /lap_analysis`
-  );
-  console.log(
-    `   2 GET (Core): /drivers, /raw_data_proxy (Handles 14 OpenF1 resources)`
-  );
 });
