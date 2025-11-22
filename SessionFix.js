@@ -1,5 +1,17 @@
-// Combined F1 Server - OpenF1 Proxy + Chart Generation (CONSOLIDATED & FINAL FIX)
-// NOW FEATURING DYNAMIC SESSION KEY RESOLUTION
+// Combined F1 Server - OpenF1 Proxy + Consolidated Insights
+// INCLUDES: 
+// 1. Hybrid Session Key Fix & Static Map Defaults
+// 2. SMART PROXY FIX
+// 3. HISTORICAL LOOKBACK & DATE FILTERING
+// 4. AUTHENTICATION LAYER (Env Vars preferred over Headers)
+// 5. ROBUST MAPPING
+// 6. CONSOLIDATED INSIGHTS
+// 7. RICH RESPONSE
+// 8. SMART DRIVER RESOLVER
+// 9. FUZZY TYPE RESOLVER
+// 10. STARTUP DIAGNOSTICS
+// 11. NEW: DEDICATED POSITION ENDPOINT
+
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -13,1224 +25,853 @@ const PORT = process.env.PORT || 3000;
 // Base URL for OpenF1 API
 const OPENF1_BASE = "https://api.openf1.org";
 
-// Simple in-memory cache for dynamic meeting data (keyed by year)
+// Caches
 const meetingsCache = {};
+const tokenCache = {}; 
 
 // Middleware
 app.use(bodyParser.json());
 
-// Cloudinary Config (Assumes environment variables are loaded via dotenv)
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true,
-});
+// Cloudinary Config
+const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+const cloudApiKey = process.env.CLOUDINARY_API_KEY;
+const cloudApiSecret = process.env.CLOUDINARY_API_SECRET;
 
-// Chart.js Config (for server-side rendering)
+if (cloudName && cloudApiKey && cloudApiSecret) {
+    cloudinary.config({
+        cloud_name: cloudName,
+        api_key: cloudApiKey,
+        api_secret: cloudApiSecret,
+        secure: true,
+    });
+}
+
+// Chart.js Config
 const width = 1000;
 const height = 600;
 const chartCallback = (ChartJS) => {
   ChartJS.defaults.responsive = false;
   ChartJS.defaults.maintainAspectRatio = false;
 };
-const chartJSNodeCanvas = new ChartJSNodeCanvas({
-  width,
-  height,
-  chartCallback,
-});
+const chartJSNodeCanvas = new ChartJSNodeCanvas({ width, height, chartCallback });
+
+// ============================================
+// 🔐 AUTHENTICATION HELPERS
+// ============================================
+async function getAccessToken(username, password) {
+    if (!username || !password) return null;
+    const now = Date.now();
+    if (tokenCache[username] && tokenCache[username].expiresAt > (now + 60000)) {
+        return tokenCache[username].token;
+    }
+    console.log(`[Auth] Fetching new token for user: ${username}`);
+    try {
+        const params = new URLSearchParams();
+        params.append("username", username);
+        params.append("password", password);
+        const response = await axios.post(`${OPENF1_BASE}/token`, params, {
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        });
+        tokenCache[username] = { token: response.data.access_token, expiresAt: now + (response.data.expires_in * 1000) };
+        return response.data.access_token;
+    } catch (err) {
+        console.error("[Auth] Token fetch failed:", err.response ? err.response.data : err.message);
+        return null;
+    }
+}
+
+async function resolveTokenFromRequest(req) {
+    const envUser = process.env.OPENF1_USERNAME;
+    const envPass = process.env.OPENF1_PASSWORD;
+    if (envUser && envPass) return await getAccessToken(envUser, envPass);
+
+    const headerUser = req.headers['openf1-username'];
+    const headerPass = req.headers['openf1-password'];
+    if (headerUser && headerPass) return await getAccessToken(headerUser, headerPass);
+    
+    return null;
+}
 
 // ============================================
 // CORE HELPERS
 // ============================================
+const filterByMonth = (data, monthInput) => {
+    if (!monthInput || !Array.isArray(data)) return data;
+    const monthMap = { "jan": 0, "january": 0, "01": 0, "1": 0, "feb": 1, "february": 1, "02": 1, "2": 1, "mar": 2, "march": 2, "03": 2, "3": 2, "apr": 3, "april": 3, "04": 3, "4": 3, "may": 4, "05": 4, "5": 4, "jun": 5, "june": 5, "06": 5, "6": 5, "jul": 6, "july": 6, "07": 6, "7": 6, "aug": 7, "august": 7, "08": 7, "8": 7, "sep": 8, "september": 8, "09": 8, "9": 8, "oct": 9, "october": 9, "10": 9, "nov": 10, "november": 10, "11": 10, "dec": 11, "december": 11, "12": 11 };
+    const targetMonth = monthMap[monthInput.toString().toLowerCase().trim()];
+    if (targetMonth === undefined) return data;
+    return data.filter(item => item.date_start && new Date(item.date_start).getUTCMonth() === targetMonth);
+};
 
-// Utility to proxy requests
-async function fetchFromOpenF1(path, query) {
+async function fetchFromOpenF1(path, query, token = null) {
   try {
-    const url = `${OPENF1_BASE}${path}`;
-    const res = await axios.get(url, { params: query });
+    const config = { params: query, headers: {} };
+    if (token) config.headers['Authorization'] = `Bearer ${token}`;
+    const res = await axios.get(`${OPENF1_BASE}${path}`, config);
     return res.data;
   } catch (err) {
-    console.error(`OpenF1 API error on ${path}:`, err.message);
-    // Throw the raw axios error object for correct status code handling.
+    if (err.response && err.response.status !== 404) console.error(`OpenF1 API error on ${path}:`, err.message);
     throw err;
   }
 }
 
-const sanitizeOpenF1Date = (dateString) => {
-  if (!dateString) return null;
-  const date = new Date(dateString);
-  // Returns standardized ISO string with millisecond precision and Z
-  return date.toISOString().slice(0, 23) + "Z";
-};
+const sanitizeOpenF1Date = (dateString) => dateString ? new Date(dateString).toISOString().slice(0, 23) + "Z" : null;
 
-// Helper to map user input (e.g., "R") to OpenF1 Session Names
 const mapSessionType = (type) => {
-  const map = {
-    R: "Race",
-    Q: "Qualifying",
-    FP1: "Practice 1",
-    FP2: "Practice 2",
-    FP3: "Practice 3",
-    S: "Sprint",
-    RACE: "Race",
-    QUALIFYING: "Qualifying",
-  };
+  if (!type) return "Race";
+  const map = { R: "Race", Q: "Qualifying", FP1: "Practice 1", FP2: "Practice 2", FP3: "Practice 3", S: "Sprint", RACE: "Race", QUALIFYING: "Qualifying" };
   return map[type.toUpperCase().trim()] || "Race";
 };
 
-// Helper to Upload Buffer to Cloudinary
 const uploadImageToCloudinary = async (buffer, publicId) => {
+  if (!cloudinary.config().cloud_name) throw new Error("Cloudinary credentials missing");
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
-      {
-        folder: "f1_charts",
-        public_id: `f1_visuals/${publicId}`,
-        resource_type: "image",
-      },
-      (error, result) => {
-        if (error) return reject(error);
-        resolve(result.secure_url);
-      }
+      { folder: "f1_charts", public_id: `f1_visuals/${publicId}`, resource_type: "image" },
+      (error, result) => error ? reject(error) : resolve(result.secure_url)
     );
     uploadStream.end(buffer);
   });
 };
 
-// Helper to convert drivers to colors
 const getDriverColor = (driver) => {
-  const colors = {
-    VER: "#0600ef",
-    PER: "#0600ef",
-    LEC: "#dc0000",
-    SAI: "#dc0000",
-    HAM: "#00d2be",
-    RUS: "#00d2be",
-    NOR: "#ff8700",
-    PIA: "#ff8700",
-    ALO: "#006f62",
-    STR: "#006f62",
-  };
+  const colors = { VER: "#0600ef", PER: "#0600ef", LEC: "#dc0000", SAI: "#dc0000", HAM: "#00d2be", RUS: "#00d2be", NOR: "#ff8700", PIA: "#ff8700", ALO: "#006f62", STR: "#006f62" };
   return colors[driver] || "#808080";
 };
 
 // ============================================
-// DYNAMIC MAPPING LOGIC (New/Refactored)
+// DYNAMIC MAPPING & RESOLVER LOGIC
 // ============================================
+const normalizeString = (str) => str ? str.replace(/[_\-]/g, " ").toUpperCase().replace(/[^A-Z\s]/g, "").trim() : "";
 
-/**
- * Normalizes a string for map key (uppercase, remove special chars).
- */
-const normalizeString = (str) => str.toUpperCase().replace(/[^A-Z\s]/g, "").trim();
+const fetchAndBuildLocationMap = async (year, token = null) => {
+  if (meetingsCache[year]) return meetingsCache[year];
+  const map = new Map([
+    ["ABU DHABI", "United Arab Emirates"], ["ABUDHABI", "United Arab Emirates"], ["YAS MARINA", "United Arab Emirates"], ["YASMARINA", "United Arab Emirates"], ["UAE", "United Arab Emirates"],
+    ["SILVERSTONE", "Great Britain"], ["BRITISH", "Great Britain"], ["UK", "Great Britain"],
+    ["SPA", "Belgium"], ["SPA FRANCORCHAMPS", "Belgium"], ["MONZA", "Italy"], ["IMOLA", "Italy"], ["MONACO", "Monaco"], ["BAKU", "Azerbaijan"], ["AZERBAIJAN", "Azerbaijan"],
+    ["COTA", "United States"], ["AUSTIN", "United States"], ["MIAMI", "United States"], ["LAS VEGAS", "United States"], ["LASVEGAS", "United States"], ["VEGAS", "United States"], ["USA", "United States"], ["US", "United States"],
+    ["MEXICO", "Mexico"], ["MEXICO CITY", "Mexico"], ["MEXICOCITY", "Mexico"], ["INTERLAGOS", "Brazil"], ["SAO PAULO", "Brazil"], ["SAOPAULO", "Brazil"], ["BRAZIL", "Brazil"],
+    ["SUZUKA", "Japan"], ["JAPAN", "Japan"], ["JEDDAH", "Saudi Arabia"], ["SAUDI", "Saudi Arabia"], ["BAHRAIN", "Bahrain"], ["SAKHIR", "Bahrain"],
+    ["MELBOURNE", "Australia"], ["AUSTRALIA", "Australia"], ["MONTREAL", "Canada"], ["CANADA", "Canada"], ["BARCELONA", "Spain"], ["SPAIN", "Spain"],
+    ["ZANDVOORT", "Netherlands"], ["DUTCH", "Netherlands"], ["HUNGARORING", "Hungary"], ["HUNGARY", "Hungary"],
+    ["RED BULL RING", "Austria"], ["REDBULLRING", "Austria"], ["AUSTRIA", "Austria"], ["SPIELBERG", "Austria"],
+    ["SINGAPORE", "Singapore"], ["MARINA BAY", "Singapore"], ["MARINABAY", "Singapore"], ["QATAR", "Qatar"], ["LUSAIL", "Qatar"], ["CHINA", "China"], ["SHANGHAI", "China"]
+  ]);
 
-/**
- * Fetches all meeting data for a given year and builds a dynamic location-to-country map.
- * This map is cached to avoid repeated API calls.
- */
-const fetchAndBuildLocationMap = async (year) => {
-    if (meetingsCache[year]) {
-        console.log(`[CACHE] Returning map for year ${year} from cache.`);
-        return meetingsCache[year];
+  try {
+    const config = { params: { year }, timeout: 3000, headers: token ? { 'Authorization': `Bearer ${token}` } : {} };
+    const response = await axios.get(`${OPENF1_BASE}/v1/meetings`, config);
+    if (response.data && response.data.length > 0) {
+      response.data.forEach((m) => {
+        const country = m.country_name;
+        map.set(normalizeString(country), country);
+        if (m.location) map.set(normalizeString(m.location), country);
+        if (m.meeting_name) {
+            map.set(normalizeString(m.meeting_name), country);
+            if (m.meeting_name.split(/\s+/)[0]) map.set(normalizeString(m.meeting_name.split(/\s+/)[0]), country);
+        }
+      });
+      meetingsCache[year] = map;
     }
+    return map;
+  } catch (err) { return map; }
+};
 
-    const map = new Map();
-    try {
-        const url = `${OPENF1_BASE}/v1/meetings`;
-        const response = await axios.get(url, { params: { year: year } });
-        const meetings = response.data;
+const resolveCountryFromHistory = async (fuzzyName, token = null) => {
+    const currentYear = new Date().getFullYear();
+    const years = [currentYear, currentYear - 1, currentYear - 2, currentYear - 3];
+    const normalized = normalizeString(fuzzyName);
+    for (const year of years) {
+        try {
+            const map = await fetchAndBuildLocationMap(year, token);
+            const resolved = map.get(normalized) || map.get(normalized.split(/\s+/)[0]);
+            if (resolved) return resolved;
+        } catch (e) { }
+    }
+    return null;
+};
 
-        if (meetings.length === 0) {
-            console.warn(`No meeting data found for year ${year}.`);
-            return map;
+const getSessionKey = async (year, location, sessionType, token = null, month = null) => {
+  let countryToQuery = await resolveCountryFromHistory(location, token) || location;
+  try {
+    const openF1Type = mapSessionType(sessionType);
+    const config = { params: { year, country_name: countryToQuery, session_name: openF1Type }, headers: token ? { 'Authorization': `Bearer ${token}` } : {} };
+    const response = await axios.get(`${OPENF1_BASE}/v1/sessions`, config);
+    let sessions = response.data;
+    
+    if (sessions.length === 0) throw new Error(`Session not found for '${countryToQuery}' and '${openF1Type}' in year ${year}.`);
+    
+    if (month) {
+        sessions = filterByMonth(sessions, month);
+        if (sessions.length === 0) throw new Error(`No sessions found in ${month} for ${countryToQuery} in year ${year}.`);
+    }
+    sessions.sort((a, b) => new Date(a.date_start) - new Date(b.date_start));
+    return sessions[sessions.length - 1].session_key;
+  } catch (error) {
+    throw new Error(`Failed to locate session: ${error.response ? error.response.data.error : error.message}`);
+  }
+};
+
+const resolveDriverNumber = async (sessionKey, driverInput, token) => {
+    if (!driverInput) return null;
+    const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+    const needle = driverInput.toString().toLowerCase().trim();
+    const match = drivers.find(d => {
+        return ((d.name_acronym && d.name_acronym.toLowerCase() === needle) || (d.driver_number && d.driver_number.toString() === needle) || (d.last_name && d.last_name.toLowerCase().includes(needle)) || (d.full_name && d.full_name.toLowerCase().includes(needle)));
+    });
+    if (match) {
+        console.log(`[Driver Resolver] Resolved '${driverInput}' -> #${match.driver_number} (${match.name_acronym})`);
+        return match.driver_number;
+    }
+    return null;
+}
+
+const resolveInsightType = (inputType) => {
+    if (!inputType) return null;
+    const normalizedInput = inputType.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const keys = Object.keys(INSIGHT_HANDLERS);
+    const match = keys.find(k => k.toLowerCase().replace(/[^a-z0-9]/g, "") === normalizedInput);
+    if (match) console.log(`[Type Resolver] '${inputType}' -> '${match}'`);
+    return match || null;
+};
+
+// ============================================
+// 🧩 INSIGHT HANDLERS
+// ============================================
+const INSIGHT_HANDLERS = {
+    race_results: async (sessionKey, body, token) => {
+        const { data: results } = await axios.get(`${OPENF1_BASE}/v1/session_result?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!results || results.length === 0) throw new Error("No race result data found.");
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.full_name || d.name_acronym);
+        const teamMap = {}; drivers.forEach(d => teamMap[d.driver_number] = d.team_name);
+        const leaderboard = results.map(r => {
+            let status = "Finished";
+            if (r.is_dnf || r.dnf) status = "DNF"; 
+            if (r.is_dns || r.dns) status = "DNS";
+            if (r.is_dsq || r.dsq) status = "DSQ";
+            let timeOrGap = status;
+            if (r.position === 1) timeOrGap = formatDuration(r.duration);
+            else if (r.gap_to_leader !== null && r.gap_to_leader !== undefined) {
+                if (typeof r.gap_to_leader === 'number') timeOrGap = `+${r.gap_to_leader.toFixed(3)}s`;
+                else timeOrGap = r.gap_to_leader;
+            }
+            return { position: r.position || 999, driver: dMap[r.driver_number] || r.name_acronym, team: r.team_name || teamMap[r.driver_number] || "Unknown", time_or_gap: timeOrGap, points: r.points || 0, status: status, grid_start: r.grid_position };
+        }).sort((a, b) => a.position - b.position);
+        return { data_type: "Final Classification", count: leaderboard.length, leaderboard: leaderboard };
+    },
+
+    starting_grid: async (sessionKey, body, token) => {
+        const { data: results } = await axios.get(`${OPENF1_BASE}/v1/session_result?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!results || results.length === 0) throw new Error("No grid data found.");
+        const grid = results.filter(r => r.grid_position !== null).map(r => ({ position: r.grid_position, driver: r.name_acronym, team: r.team_name, driver_number: r.driver_number })).sort((a, b) => a.position - b.position);
+        return { data_type: "Starting Grid", count: grid.length, grid: grid };
+    },
+
+    // 2. Race Control Summary (FINAL VERSION)
+    race_control_summary: async (sessionKey, body, token) => {
+        let driverNum = null;
+        let driverInfo = null;
+        
+        if (body.driver) {
+            const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            const needle = body.driver.toString().toLowerCase().trim();
+            driverInfo = drivers.find(d => {
+                return ((d.name_acronym && d.name_acronym.toLowerCase() === needle) || (d.driver_number && d.driver_number.toString() === needle) || (d.last_name && d.last_name.toLowerCase().includes(needle)) || (d.full_name && d.full_name.toLowerCase().includes(needle)));
+            });
+            
+            if (!driverInfo) {
+                throw new Error(`Driver '${body.driver}' not found in this session.`);
+            }
+            
+            driverNum = driverInfo.driver_number;
         }
 
-        meetings.forEach(m => {
-            const country = m.country_name;
-            
-            // 1. Map from the official country name itself
-            map.set(normalizeString(country), country);
-
-            // 2. Map from the location/city (e.g., 'Silverstone', 'Marina Bay')
-            if (m.location) {
-                map.set(normalizeString(m.location), country);
-            }
-
-            // 3. Map from the full meeting name (e.g., 'British Grand Prix')
-            if (m.meeting_name) {
-                map.set(normalizeString(m.meeting_name), country);
-                
-                // Map from the first word of the meeting name (e.g., 'BRITISH')
-                const firstWord = m.meeting_name.split(/\s+/)[0];
-                if (firstWord) {
-                    map.set(normalizeString(firstWord), country);
-                }
-            }
-
-            // 4. Handle common aliases and abbreviations (manual list for robustness)
-            if (country === "Great Britain") {
-                map.set("SILVERSTONE", country);
-                map.set("UK", country);
-                map.set("BRITAIN", country);
-                map.set("UNITED KINGDOM", country);
-            } else if (country === "United Arab Emirates") {
-                map.set("ABU DHABI", country);
-                map.set("UAE", country);
-            } else if (country === "United States") {
-                map.set("COTA", country);
-                map.set("US", country);
-                map.set("USA", country);
-            }
+        const { data: messages } = await axios.get(`${OPENF1_BASE}/v1/race_control?session_key=${sessionKey}`, { 
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {} 
         });
 
-        meetingsCache[year] = map;
-        return map;
+        let filtered = messages || [];
+        
+        // 1. Filter by Driver (STRICT MODE)
+        if (driverInfo) {
+            const dAcronym = driverInfo.name_acronym.toLowerCase(); 
+            const dName = driverInfo.last_name.toLowerCase();
+            
+            filtered = filtered.filter(m => {
+                const msgLower = m.message ? m.message.toLowerCase() : "";
+                
+                // --- A. Target Driver Events (MUST Match) ---
+                if (m.driver_number === driverNum) return true;
+                if (msgLower.match(new RegExp(`\\bcar ${driverNum}\\b`))) return true;
+                if (msgLower.includes(`(${dAcronym})`)) return true;
+                if (msgLower.includes(dName)) return true;
 
-    } catch (err) {
-        throw new Error("Failed to initialize dynamic location map from OpenF1 API.");
+                // --- B. Global Context Events (Must NOT target another driver) ---
+                if (!m.driver_number) {
+                    const globalKeywords = ["safety car", "virtual safety car", "red flag", "chequered flag", "drs enabled", "drs disabled", "green light", "track clear"];
+                    if (globalKeywords.some(kw => msgLower.includes(kw))) return true;
+                    
+                    const globalCats = ["safetycar", "virtualsafetycar", "redflag", "drs"];
+                    if (globalCats.includes(m.category?.toLowerCase())) return true;
+                    
+                    if (m.category?.toLowerCase() === 'flag' && ["green", "chequered", "red", "yellow"].includes(m.flag?.toLowerCase())) return true;
+                }
+
+                return false;
+            });
+        }
+
+        // 2. Filter by Lap (TIME-WINDOW)
+        const lapParam = body.lap_number || body.lap;
+        if (lapParam) {
+            const targetLap = parseInt(lapParam);
+            
+            let refDriver = driverNum; // Use target driver for time window if possible
+            if (!refDriver) {
+                 const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+                 const winner = drivers.find(d => d.position === 1) || drivers[0];
+                 refDriver = winner.driver_number;
+            }
+
+            const { data: lapData } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${refDriver}&lap_number=${targetLap}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            
+            if (lapData && lapData.length > 0) {
+                const lap = lapData[0];
+                const startMs = new Date(lap.date_start).getTime();
+                const endMs = startMs + (lap.lap_duration * 1000);
+
+                filtered = filtered.filter(m => {
+                    if (m.lap_number === targetLap) return true;
+                    const msgTime = new Date(m.date).getTime();
+                    return (msgTime >= startMs && msgTime <= endMs);
+                });
+            } else {
+                filtered = [];
+            }
+        }
+
+        // 3. Filter by Keyword
+        if (body.filter) { 
+            const filterRaw = body.filter.toLowerCase();
+            const filterSpaced = filterRaw.replace("safetycar", "safety car").replace("virtualsafetycar", "virtual safety car");
+            filtered = filtered.filter(m => {
+                const corpus = [m.category, m.flag, m.message].join(" ").toLowerCase();
+                return corpus.includes(filterRaw) || corpus.includes(filterSpaced);
+            });
+        }
+
+        const formatted = filtered.map(m => ({
+            time: m.date,
+            lap: m.lap_number,
+            category: m.category,
+            flag: m.flag,
+            message: m.message,
+            driver_number: m.driver_number
+        }));
+
+        formatted.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+        let explanation = `Found ${formatted.length} event(s).`;
+        if (formatted.length === 0) {
+            const parts = [];
+            if (body.driver) parts.push(`for driver '${body.driver}'`);
+            if (lapParam) parts.push(`on lap ${lapParam}`);
+            if (body.filter) parts.push(`matching '${body.filter}'`);
+            explanation = `No events found ${parts.join(" ")}.`;
+        }
+
+        return {
+            status_note: explanation,
+            data_type: "Race Control Summary",
+            count: formatted.length,
+            filter_applied: `Driver: ${body.driver || "All"} (Strict), Lap: ${lapParam || "All"}, Type: ${body.filter || "All"}`,
+            messages: formatted
+        };
+    },
+
+    // ... (All other handlers remain unchanged)
+    team_radio_summary: async (sessionKey, body, token) => {
+        let driverNum = null;
+        if (body.driver) {
+            driverNum = await resolveDriverNumber(sessionKey, body.driver, token);
+            if (!driverNum) throw new Error(`Driver '${body.driver}' not found.`);
+        }
+
+        const query = { session_key: sessionKey };
+        if (driverNum) query.driver_number = driverNum;
+
+        const { data: radios } = await axios.get(`${OPENF1_BASE}/v1/team_radio`, { 
+            params: query,
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {} 
+        });
+
+        if (!radios || radios.length === 0) throw new Error("No team radio messages found.");
+
+        let driverMap = {};
+        if (!driverNum) {
+             const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+             drivers.forEach(d => driverMap[d.driver_number] = d.name_acronym);
+        }
+
+        const formatted = radios.map(r => ({
+            date: r.date,
+            driver: driverMap[r.driver_number] || r.driver_number, 
+            driver_number: r.driver_number,
+            recording_url: r.recording_url
+        }));
+
+        formatted.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+        return {
+            data_type: "Team Radio Summary",
+            driver_filter: body.driver || "All",
+            count: formatted.length,
+            messages: formatted
+        };
+    },
+
+    overtake_analysis: async (sessionKey, body, token) => {
+        if (!token) throw new Error("Overtake data requires authentication (Paid Tier).");
+        const { data: overtakes } = await axios.get(`${OPENF1_BASE}/v1/overtakes?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!overtakes || overtakes.length === 0) throw new Error("No overtake data found.");
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.name_acronym);
+        let relevantOvertakes = overtakes;
+        if (body.driver) {
+            const targetNum = await resolveDriverNumber(sessionKey, body.driver, token);
+            if (targetNum) relevantOvertakes = overtakes.filter(o => o.overtaking_driver_number === targetNum || o.overtaken_driver_number === targetNum);
+        }
+        if (body.lap_number) {
+            const lapNum = parseInt(body.lap_number);
+            const refDriver = body.driver ? (await resolveDriverNumber(sessionKey, body.driver, token)) : (drivers.find(d => d.position === 1)?.driver_number || drivers[0].driver_number);
+            const { data: lapData } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${refDriver}&lap_number=${lapNum}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            if (lapData.length > 0) {
+                const lap = lapData[0];
+                const startMs = new Date(lap.date_start).getTime();
+                const endMs = startMs + (lap.lap_duration * 1000);
+                relevantOvertakes = relevantOvertakes.filter(o => { const oTime = new Date(o.date).getTime(); return oTime >= startMs && oTime <= endMs; });
+            }
+        }
+        const formatted = relevantOvertakes.map(o => ({ overtaker: dMap[o.overtaking_driver_number] || o.overtaking_driver_number, overtaken: dMap[o.overtaken_driver_number] || o.overtaken_driver_number, time: o.date }));
+        return { data_type: "Overtake Analysis", count: formatted.length, overtakes: formatted };
+    },
+
+    position_change_summary: async (sessionKey, body, token) => {
+        if (body.lap_number) {
+            const currentLapNum = parseInt(body.lap_number);
+            if (currentLapNum <= 1) throw new Error("Cannot calculate changes for Lap 1.");
+            const { data: allLaps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            const getLeaderboard = (lapNum) => {
+                const laps = allLaps.filter(l => l.lap_number === lapNum && l.date_start && l.lap_duration);
+                const withFinish = laps.map(l => ({ driver_number: l.driver_number, finish_time: new Date(l.date_start).getTime() + (l.lap_duration * 1000) }));
+                withFinish.sort((a, b) => a.finish_time - b.finish_time);
+                const posMap = {}; withFinish.forEach((entry, index) => { posMap[entry.driver_number] = index + 1; });
+                return posMap;
+            };
+            const posCurrent = getLeaderboard(currentLapNum);
+            const posPrev = getLeaderboard(currentLapNum - 1);
+            const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            const driverMap = {}; drivers.forEach(d => driverMap[d.driver_number] = d.name_acronym);
+            let changes = [];
+            Object.keys(posCurrent).forEach(driverNum => {
+                if (posPrev[driverNum] && posCurrent[driverNum]) {
+                    const gained = posPrev[driverNum] - posCurrent[driverNum];
+                    changes.push({ driver: driverMap[driverNum] || driverNum, driver_number: driverNum, lap_start_pos: posPrev[driverNum], lap_end_pos: posCurrent[driverNum], positions_gained: gained, status: gained > 0 ? "GAINED" : (gained < 0 ? "LOST" : "SAME") });
+                }
+            });
+            if (body.driver) {
+                const targetNum = await resolveDriverNumber(sessionKey, body.driver, token);
+                if (targetNum) changes = changes.filter(c => c.driver_number == targetNum);
+            }
+            changes.sort((a, b) => b.positions_gained - a.positions_gained);
+            return { data_type: `Lap ${currentLapNum} Position Changes`, total_drivers_tracked: changes.length, changes: changes };
+        }
+        const { data: results } = await axios.get(`${OPENF1_BASE}/v1/session_result?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!results || results.length === 0) throw new Error("No position data found.");
+        const changes = results.map(r => {
+            if (r.position === null || r.grid_position === null) return null;
+            const gained = r.grid_position - r.position; 
+            return { driver: r.name_acronym, team: r.team_name, start: r.grid_position, finish: r.position, positions_gained: gained, status: gained > 0 ? "GAINED" : (gained < 0 ? "LOST" : "SAME") };
+        }).filter(Boolean);
+        changes.sort((a, b) => b.positions_gained - a.positions_gained);
+        return { data_type: "Full Race Overtake Summary", total_drivers: changes.length, all_changes: changes };
+    },
+
+    fastest_lap_summary: async (sessionKey, body, token) => {
+        const { data: laps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        let filtered = laps.filter((l) => l.lap_duration);
+        if (body.driver) {
+            const driverNum = await resolveDriverNumber(sessionKey, body.driver, token);
+            if (driverNum) filtered = filtered.filter(l => l.driver_number === driverNum);
+            else throw new Error(`Driver '${body.driver}' not found.`);
+        }
+        if (!filtered.length) throw new Error("No valid laps found.");
+        filtered.sort((a, b) => a.lap_duration - b.lap_duration);
+        const fastLap = filtered[0];
+        const dDetail = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}&driver_number=${fastLap.driver_number}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        let compound = "N/A"; let tyreAge = 0;
+        try {
+            const { data: stints } = await axios.get(`${OPENF1_BASE}/v1/stints?session_key=${sessionKey}&driver_number=${fastLap.driver_number}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            const matchingStint = stints.find(s => fastLap.lap_number >= s.lap_start && fastLap.lap_number <= s.lap_end);
+            if (matchingStint) { compound = matchingStint.compound || "Unknown"; tyreAge = fastLap.lap_number - matchingStint.lap_start + 1; }
+        } catch(e) { }
+        return { driver: dDetail.data[0]?.name_acronym || "UNK", full_name: dDetail.data[0]?.full_name, lap_time: fastLap.lap_duration, lap_number: fastLap.lap_number, compound: compound, tyre_age_laps: tyreAge };
+    },
+
+    telemetry_chart: async (sessionKey, body, token) => {
+        if (!body.driver || !body.lap_number) throw new Error("Driver and Lap Number required.");
+        const driverNum = await resolveDriverNumber(sessionKey, body.driver, token);
+        if (!driverNum) throw new Error(`Driver '${body.driver}' not found.`);
+        const lRes = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}&lap_number=${body.lap_number}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!lRes.data.length) throw new Error("Lap not found.");
+        const lap = lRes.data[0];
+        const start = lap.date_start;
+        const end = new Date(new Date(start).getTime() + lap.lap_duration * 1000).toISOString();
+        const { data: tel } = await axios.get(`${OPENF1_BASE}/v1/car_data?session_key=${sessionKey}&driver_number=${driverNum}&date>=${start}&date<=${end}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const config = { type: "line", data: { labels: tel.map((_, i) => i), datasets: [{ label: "Speed", data: tel.map(t => t.speed), borderColor: "red", borderWidth: 1, pointRadius: 0, fill: false }] }, options: { scales: { y: { title: { display: true, text: "Speed (km/h)" } }, x: { display: false } }, plugins: { title: { display: true, text: `${body.driver} Lap ${body.lap_number} Speed` }, legend: { display: false } } } };
+        const url = await uploadImageToCloudinary(await chartJSNodeCanvas.renderToBuffer(config), `${body.year}-${body.gp}-${body.driver}-lap${body.lap_number}-speed`);
+        return { image_url: url, data_type: "Speed Trace" };
+    },
+
+    pitstops_summary: async (sessionKey, body, token) => {
+        const { data: pits } = await axios.get(`${OPENF1_BASE}/v1/pit?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.name_acronym);
+        let targetPits = pits;
+        if (body.driver) { const driverNum = await resolveDriverNumber(sessionKey, body.driver, token); if (driverNum) targetPits = pits.filter(p => p.driver_number === driverNum); }
+        let enhancedPits = targetPits;
+        try {
+            const { data: stints } = await axios.get(`${OPENF1_BASE}/v1/stints?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            enhancedPits = targetPits.map(p => { const stint = stints.find(s => s.driver_number === p.driver_number && Math.abs(s.lap_start - p.lap_number) <= 1); return { ...p, tyre_fitted: stint ? stint.compound : "Unknown" }; });
+        } catch(e) {}
+        return { pit_stops: enhancedPits.map(p => ({ driver: dMap[p.driver_number] || p.driver_number, lap: p.lap_number, duration: p.pit_duration, tyres_fitted: p.ty_fitted || "Unknown" })), count: enhancedPits.length };
+    },
+
+    pitstops_chart: async (sessionKey, body, token) => {
+        const { data: pits } = await axios.get(`${OPENF1_BASE}/v1/pit?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.name_acronym);
+        const counts = {};
+        pits.forEach(p => { const n = dMap[p.driver_number] || p.driver_number; counts[n] = (counts[n] || 0) + 1; });
+        const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+        const config = { type: "bar", data: { labels: sorted, datasets: [{ label: "Stops", data: sorted.map(d => counts[d]), backgroundColor: "coral" }] }, options: { plugins: { title: { display: true, text: "Pit Stops" } } } };
+        const url = await uploadImageToCloudinary(await chartJSNodeCanvas.renderToBuffer(config), `${body.year}-${body.gp}-pit-count`);
+        return { image_url: url, data_type: "Pit Count Chart" };
+    },
+
+    gap_chart: async (sessionKey, body, token) => {
+        const { data: laps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.name_acronym);
+        const top5 = drivers.slice(0, 5).map(d => d.driver_number);
+        const dTimes = {};
+        laps.forEach(l => { if (!dTimes[l.driver_number]) dTimes[l.driver_number] = []; dTimes[l.driver_number].push({ lap: l.lap_number, time: l.lap_duration || 100 }); });
+        const cumulative = {};
+        Object.keys(dTimes).forEach(d => { dTimes[d].sort((a,b) => a.lap - b.lap); cumulative[d] = []; let tot = 0; dTimes[d].forEach(l => { tot += l.time; cumulative[d].push({lap: l.lap, total: tot}); }); });
+        const ref = top5[0];
+        if (!cumulative[ref]) throw new Error("Insufficient data for gap analysis.");
+        const datasets = top5.map(dNum => { if (!cumulative[dNum]) return null; const data = []; cumulative[dNum].forEach((l, i) => { if(cumulative[ref][i]) data.push(l.total - cumulative[ref][i].total); }); return { label: dMap[dNum], data, borderColor: getDriverColor(dMap[dNum]), fill: false, pointRadius: 0 }; }).filter(Boolean);
+        const config = { type: "line", data: { labels: cumulative[ref].map(l => l.lap), datasets }, options: { scales: { y: { reverse: true, title: { display: true, text: "Gap (s)" } } }, plugins: { title: { display: true, text: "Gap to Leader" } } } };
+        const url = await uploadImageToCloudinary(await chartJSNodeCanvas.renderToBuffer(config), `${body.year}-${body.gp}-gap-chart`);
+        return { image_url: url, data_type: "Gap Chart" };
+    },
+
+    weather_chart: async (sessionKey, body, token) => {
+        const { data: w } = await axios.get(`${OPENF1_BASE}/v1/weather?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!w.length) throw new Error("No weather data.");
+        const config = { type: "line", data: { labels: w.map((_,i) => i), datasets: [{ label: "Track Temp", data: w.map(x => x.track_temperature), borderColor: "red", fill: false, pointRadius: 0 }, { label: "Air Temp", data: w.map(x => x.air_temperature), borderColor: "skyblue", fill: false, pointRadius: 0 }] }, options: { plugins: { title: { display: true, text: "Temperatures" } } } };
+        const url = await uploadImageToCloudinary(await chartJSNodeCanvas.renderToBuffer(config), `${body.year}-${body.gp}-weather`);
+        return { image_url: url, data_type: "Weather Chart" };
+    },
+
+    lap_analysis: async (sessionKey, body, token) => {
+        const { data: laps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const dMap = {}; drivers.forEach(d => dMap[d.driver_number] = d.name_acronym);
+        let targetLaps = laps.filter(l => l.lap_duration);
+        if (body.driver) {
+            const driverNum = await resolveDriverNumber(sessionKey, body.driver, token);
+            if (driverNum) targetLaps = targetLaps.filter(l => l.driver_number === driverNum);
+            else throw new Error(`Driver '${body.driver}' not found.`);
+        }
+        if (!targetLaps.length) throw new Error("No laps found.");
+        const times = targetLaps.map(l => l.lap_duration);
+        const avg = times.reduce((a,b)=>a+b,0) / times.length;
+        const std = Math.sqrt(times.reduce((s,t) => s + Math.pow(t-avg, 2), 0) / times.length);
+        const dNums = body.driver ? [targetLaps[0].driver_number] : [...new Set(targetLaps.map(l => l.driver_number))].slice(0,5);
+        const datasets = dNums.map(dn => ({ label: dMap[dn] || dn, data: laps.filter(l => l.driver_number === dn && l.lap_duration).map(l => l.lap_duration), borderColor: getDriverColor(dMap[dn]), fill: false, pointRadius: 1 }));
+        const config = { type: "line", data: { labels: datasets[0].data.map((_,i)=>i+1), datasets }, options: { scales: { y: { title: { display: true, text: "Lap Time" } } }, plugins: { title: { display: true, text: "Lap Consistency" } } } };
+        const url = await uploadImageToCloudinary(await chartJSNodeCanvas.renderToBuffer(config), `${body.year}-${body.gp}-lap-analysis`);
+        return { summary: { average_lap: parseFloat(avg.toFixed(3)), std_dev: parseFloat(std.toFixed(3)), count: targetLaps.length }, chart_url: url };
+    },
+    
+    telemetry_summary: async (sessionKey, body, token) => {
+        if (!body.driver || !body.lap_number) throw new Error("Driver and Lap Number required.");
+        const driverNum = await resolveDriverNumber(sessionKey, body.driver, token);
+        if (!driverNum) throw new Error(`Driver '${body.driver}' not found.`);
+        const lRes = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${driverNum}&lap_number=${body.lap_number}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        if (!lRes.data.length) throw new Error("Lap not found.");
+        const lap = lRes.data[0];
+        const start = lap.date_start;
+        const end = new Date(new Date(start).getTime() + lap.lap_duration * 1000).toISOString();
+        const { data: tel } = await axios.get(`${OPENF1_BASE}/v1/car_data?session_key=${sessionKey}&driver_number=${driverNum}&date>=${start}&date<=${end}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const speeds = tel.map(t => t.speed);
+        const maxSpeed = Math.max(...speeds);
+        const avgSpeed = speeds.reduce((a,b) => a+b, 0) / speeds.length;
+        const throttles = tel.map(t => t.throttle);
+        const avgThrottle = throttles.reduce((a,b) => a+b, 0) / throttles.length;
+        return { max_speed_kph: parseFloat(maxSpeed.toFixed(1)), avg_speed_kph: parseFloat(avgSpeed.toFixed(1)), avg_throttle_percent: parseFloat(avgThrottle.toFixed(1)) };
     }
 };
 
-/**
- * NEW: Dynamic Session Key Resolver (Replaces old rigid getSessionKey)
- * Takes a fuzzy location (gp) and resolves it to the correct OpenF1 country_name.
- * @param {number} year The F1 season year.
- * @param {string} location Fuzzy location (e.g., 'Abu Dhabi', 'Silverstone', 'Spain').
- * @param {string} sessionType Session type (e.g., 'R', 'Q').
- * @returns {number} The session_key.
- */
-const getSessionKey = async (year, location, sessionType) => {
-    const locationMap = await fetchAndBuildLocationMap(year);
-    const normalizedLocation = normalizeString(location);
+// ============================================
+// 🚀 MAIN ROUTES
+// ============================================
 
-    // Try finding by exact match or first word match
-    const openF1CountryName = 
-        locationMap.get(normalizedLocation) || 
-        locationMap.get(normalizedLocation.split(/\s+/)[0]);
-
-    if (!openF1CountryName) {
-        throw new Error(`Location '${location}' could not be resolved to an OpenF1 country.`);
+app.post("/generate_insight", async (req, res) => {
+    const { type, year, gp, location, session_type, month, session_key } = req.body;
+    
+    // FIX: Allow direct session_key usage without needing year/location
+    const loc = location || gp;
+    if (!session_key && (!year || !loc)) {
+        return res.status(400).json({ error: "Missing year/location OR session_key." });
     }
+
+    const validKey = resolveInsightType(type);
+    if (!validKey) return res.status(400).json({ error: `Invalid type '${type}'.` });
 
     try {
-        const openF1Type = mapSessionType(sessionType);
+        const token = await resolveTokenFromRequest(req);
         
-        const response = await axios.get(
-            `${OPENF1_BASE}/v1/sessions?year=${year}&country_name=${openF1CountryName}&session_name=${openF1Type}`
-        );
-        
-        if (response.data.length === 0) {
-            throw new Error(`Session not found for resolved country '${openF1CountryName}'.`);
+        let finalSessionKey = session_key;
+        if (!finalSessionKey) {
+            // Only look it up if not provided
+            finalSessionKey = await getSessionKey(year, loc, session_type, token, month);
         }
         
-        return response.data[0].session_key;
-    } catch (error) {
-        // Axios error object handling
-        const errorMessage = error.response ? error.response.data.error : error.message;
-        throw new Error(`Failed to locate session: ${errorMessage}`);
+        console.log(`[Insight] Generating ${validKey} for session ${finalSessionKey}...`);
+        const result = await INSIGHT_HANDLERS[validKey](finalSessionKey, req.body, token);
+        
+        const responsePayload = {
+            status: "Success",
+            request: { type: validKey, session_key: finalSessionKey },
+            result
+        };
+
+        console.log("[API RESPONSE]\n" + JSON.stringify(responsePayload, null, 2));
+
+        res.json(responsePayload);
+    } catch (e) {
+        console.error(`[Insight Error] ${e.message}`);
+        res.status(500).json({ error: e.message });
     }
-};
-
-
-// ============================================
-// 🎯 CONSOLIDATED PROXY ROUTE (FIXED)
-// ============================================
-
-const CONSOLIDATED_RESOURCES = [
-  "laps",
-  "meetings",
-  "sessions",
-  "pit",
-  "weather",
-  "starting_grid",
-  "stints",
-  "position",
-  "race_control",
-  "team_radio",
-  "overtakes",
-  // Custom Logic Resources
-  "car_data",
-  "lap_intervals",
-  "session_result",
-];
+});
 
 app.get("/raw_data_proxy", async (req, res) => {
   const resource = req.query.resource;
   let queryParams = { ...req.query };
+  let token = null;
+  try { token = await resolveTokenFromRequest(req); } catch (e) {}
 
-  if (!resource || !CONSOLIDATED_RESOURCES.includes(resource)) {
-    return res.status(400).json({
-      error: "Missing or invalid 'resource' parameter.",
-      valid_resources: CONSOLIDATED_RESOURCES,
-    });
-  }
-
-  // CRITICAL FIX: The resource parameter must be removed from the query sent to OpenF1
+  if (!resource) return res.status(400).json({ error: "Missing resource." });
   delete queryParams.resource;
 
-  // 2. Route to the appropriate handler (custom logic or generic proxy)
-
-  if (resource === "car_data") {
-    // --- Special Handling for car_data (Custom Lap Logic) ---
-    const { session_key, driver_number, lap_number, date } = req.query;
-
-    if (!session_key || !driver_number) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Missing required query parameters: session_key and driver_number.",
-        });
-    }
-
-    if (lap_number) {
-      try {
-        // Fetch the target lap directly
-        const targetLapNum = parseInt(lap_number);
-        const lapsSurrounding = await fetchFromOpenF1("/v1/laps", {
-          session_key,
-          driver_number,
-          lap_number: targetLapNum,
-        });
-
-        // If we only got one lap, fetch previous lap separately
-        let targetLapData = lapsSurrounding.find(
-          (l) => l.lap_number === targetLapNum
-        );
-
-        if (!targetLapData && lapsSurrounding.length === 1) {
-          targetLapData = lapsSurrounding[0];
-        }
-
-        if (lapsSurrounding.length === 0 || !targetLapData) {
-          return res.status(404).json({
-            error: `Lap ${lap_number} not found for driver ${driver_number} in session ${session_key}.`,
-            hint:
-              "Try checking available laps with: /raw_data_proxy?resource=laps&session_key=" +
-              session_key +
-              "&driver_number=" +
-              driver_number,
-          });
-        }
-
-        if (!targetLapData.lap_duration) {
-          return res.status(404).json({
-            error: `Lap ${lap_number} exists but has no valid lap_duration (likely an outlap/inlap).`,
-            lap_data: targetLapData,
-          });
-        }
-
-        // Fetch the previous lap separately if needed
-        let prevLap = null;
-        if (targetLapNum > 1) {
-          const prevLapData = await fetchFromOpenF1("/v1/laps", {
-            session_key,
-            driver_number,
-            lap_number: targetLapNum - 1,
-          });
-          if (prevLapData && prevLapData.length > 0) {
-            prevLap = prevLapData[0];
-          }
-        }
-
-        // Use whichever lap has date_start for the start time
-        let startLap = prevLap && prevLap.date_start ? prevLap : targetLapData;
-
-        if (!startLap || !startLap.date_start) {
-          return res.status(404).json({
-            error: `No valid date_start found for lap ${lap_number} or its previous lap.`,
-          });
-        }
-
-        if (!targetLapData.date_start) {
-          return res.status(404).json({
-            error: `Target lap ${lap_number} is missing date_start field.`,
-          });
-        }
-
-        // Calculate time window
-        const startTime = sanitizeOpenF1Date(startLap.date_start);
-        const targetLapEndTimeMs =
-          new Date(sanitizeOpenF1Date(targetLapData.date_start)).getTime() +
-          targetLapData.lap_duration * 1000;
-        const endTime = sanitizeOpenF1Date(
-          new Date(targetLapEndTimeMs + 2000).toISOString()
-        );
-
-        console.log(
-          `[DEBUG] Lap ${lap_number} time window: ${startTime} to ${endTime}`
-        );
-
-        // Apply dynamic date filters to the clean queryParams
-        queryParams["date>="] = startTime;
-        queryParams["date<="] = endTime;
-        delete queryParams.lap_number;
-      } catch (err) {
-        // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
-        const status = err.response ? err.response.status : 500;
-        return res
-          .status(status)
-          .json({
-            error: "Failed to fetch lap time data for car_data logic.",
-            details: err.message,
-          });
-      }
-    }
-
-    try {
-      console.log(`[DEBUG] Fetching car_data with params:`, queryParams);
-      const data = await fetchFromOpenF1("/v1/car_data", queryParams);
-      console.log(`[DEBUG] Got ${data.length} car_data records`);
-      return res.json(data);
-    } catch (err) {
-       // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
-      const status = err.response ? err.response.status : 500;
-      return res.status(status).json({ error: err.message });
-    }
-    // End Special Handling for car_data
-  } else if (resource === "lap_intervals") {
-    // --- Special Handling for lap_intervals (Custom Proximity Logic) ---
-    const { session_key, driver_number, lap_number } = req.query;
-
-    if (!session_key || !driver_number || !lap_number) {
-      return res
-        .status(400)
-        .json({ error: "Missing required parameters for lap_intervals." });
-    }
-
-    try {
-      const lapData = await fetchFromOpenF1("/v1/laps", {
-        session_key,
-        driver_number,
-        lap_number,
-      });
-      if (
-        !lapData ||
-        lapData.length === 0 ||
-        !lapData[0].date_start ||
-        !lapData[0].lap_duration
-      ) {
-        return res
-          .status(404)
-          .json({
-            error: `Valid lap duration data not found for Lap ${lap_number}.`,
-          });
-      }
-
-      const lap = lapData[0];
-      const lapEndTimeMs =
-        new Date(sanitizeOpenF1Date(lap.date_start)).getTime() +
-        lap.lap_duration * 1000;
-
-      // FIX: Increased search window to 10s before and 10s after (20s total)
-      const wideWindowMs = 10000; 
-
-      const windowStart = sanitizeOpenF1Date(
-        new Date(lapEndTimeMs - wideWindowMs).toISOString()
-      );
-      const windowEnd = sanitizeOpenF1Date(
-        new Date(lapEndTimeMs + wideWindowMs).toISOString()
-      );
-
-      const intervalData = await fetchFromOpenF1("/v1/intervals", {
-        session_key,
-        driver_number,
-        "date>=": windowStart,
-        "date<=": windowEnd,
-      });
-
-      if (intervalData.length === 0) {
-        return res
-          .status(404)
-          .json({
-            error:
-              "Interval data is missing for this lap. Try a different lap.",
-            data: [],
-          });
-      }
-
-      // Find the single record whose timestamp is closest to the exact lap end time
-      let closestRecord = intervalData.reduce((closest, current) => {
-        const currentDiff = Math.abs(
-          new Date(current.date).getTime() - lapEndTimeMs
-        );
-        const closestDiff =
-          closest && closest.date
-            ? Math.abs(new Date(closest.date).getTime() - lapEndTimeMs)
-            : Infinity;
-        return currentDiff < closestDiff ? current : closest;
-      }, intervalData[0]);
-
-      return res.json([closestRecord]);
-    } catch (err) {
-      // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
-      const status = err.response ? err.response.status : 500;
-      return res.status(status).json({ error: err.message });
-    }
-    // End Special Handling for lap_intervals
-  } else if (resource === "session_result") {
-    // --- Special Handling for session_result (Custom Required Key Logic) ---
-    const { session_key } = req.query;
-
-    if (!session_key) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "The session_result endpoint requires a 'session_key' parameter.",
-        });
-    }
-
-    try {
-      const data = await fetchFromOpenF1("/v1/session_result", queryParams);
-      return res.json(data);
-    } catch (err) {
-      // Since fetchFromOpenF1 now throws the raw error, we check for a response status here
-      const status = err.response ? err.response.status : 500;
-      return res.status(status).json({ error: err.message });
-    }
-    // End Special Handling for session_result
-  } else {
-    // 3. Handle Generic Resources (e.g., /laps, /meetings, /pit, /weather, etc.)
-    const openF1Path = `/v1/${resource}`;
-    try {
-      const data = await fetchFromOpenF1(openF1Path, queryParams);
-      return res.json(data);
-    } catch (err) {
-      // Because fetchFromOpenF1 now throws the raw error, we use err.response.status
-      const status = err.response ? err.response.status : 500;
-      return res.status(status).json({ error: err.message });
-    }
+  if (queryParams.extra_query) {
+      try { new URLSearchParams(queryParams.extra_query).forEach((v, k) => queryParams[k] = v); delete queryParams[k]; } catch(e){}
   }
-});
+  
+  const monthFilter = queryParams.month || queryParams.date;
+  if (queryParams.month) delete queryParams.month;
+  if (queryParams.date && !queryParams.date.includes('-')) delete queryParams.date;
+  
+  const ALIAS = { 'circuit_id': 'circuit_key', 'meeting_id': 'meeting_key', 'session_id': 'session_key', 'driver_id': 'driver_number' };
+  Object.entries(ALIAS).forEach(([b,g]) => { if(queryParams[b]) { queryParams[g] = queryParams[b]; delete queryParams[b]; }});
+  
+  const fuzzy = queryParams.country_name || queryParams.location || queryParams.gp;
+  if (fuzzy) {
+      const resolved = await resolveCountryFromHistory(fuzzy, token);
+      if (resolved) { queryParams.country_name = resolved; delete queryParams.location; delete queryParams.gp; }
+  }
 
-// ============================================
-// ⚡ KEEP SEPARATE GET ROUTE (Drivers)
-// ============================================
-app.get("/drivers", async (req, res) => {
   try {
-    const drivers = await fetchFromOpenF1("/v1/drivers");
-    const filterName = req.query.name;
-
-    const uniqueDriversMap = new Map();
-    drivers.forEach((driver) => {
-      const driverNumber = driver.driver_number;
-      const currentEntryKey = driver.session_key;
-      if (
-        !uniqueDriversMap.has(driverNumber) ||
-        currentEntryKey > uniqueDriversMap.get(driverNumber).session_key
-      ) {
-        uniqueDriversMap.set(driverNumber, driver);
+      let data = await fetchFromOpenF1(`/v1/${resource}`, queryParams, token);
+      if (['meetings', 'sessions'].includes(resource) && Array.isArray(data)) {
+          if (monthFilter) data = filterByMonth(data, monthFilter);
+          data.sort((a, b) => new Date(b.date_start) - new Date(a.date_start));
+          if (data.length > 5 && !queryParams.country_name) data = data.slice(0, 5);
       }
-    });
-
-    let resultDrivers = Array.from(uniqueDriversMap.values());
-    if (filterName) {
-      const searchNeedle = filterName.toLowerCase();
-      resultDrivers = resultDrivers.filter((driver) => {
-        const fullName = (driver.full_name || "").toLowerCase();
-        const broadcastName = (driver.broadcast_name || "").toLowerCase();
-        return (
-          fullName.includes(searchNeedle) ||
-          broadcastName.includes(searchNeedle)
-        );
-      });
-    }
-
-    res.json(resultDrivers);
-  } catch (err) {
-    // Handling error from fetchFromOpenF1 (which now throws raw axios error)
-    const status = err.response ? err.response.status : 500;
-    res.status(status).json({ error: "Failed to fetch or filter drivers" });
-  }
+      
+      console.log(`[API RESPONSE] Raw Proxy: ${resource}. Items: ${Array.isArray(data) ? data.length : 1}`);
+      res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// ============================================
-// 🔑 NEW: DEDICATED SESSION FINDER ENDPOINT
-// ============================================
 
 app.get("/find_session_key", async (req, res) => {
-  const { year, location, session_type } = req.query;
-
-  if (!year || !location || !session_type) {
-    return res.status(400).json({
-      error: "Missing required parameters.",
-      required: ["year", "location", "session_type (e.g., R, Q, FP1)"],
-    });
-  }
-
+  const { year, location, session_type, month } = req.query;
+  if (!year || !location) return res.status(400).json({ error: "Missing params." });
   try {
-    const sessionKey = await getSessionKey(year, location, session_type);
+    const token = await resolveTokenFromRequest(req);
+    const key = await getSessionKey(year, location, session_type, token, month);
+    const sessionDataArr = await fetchFromOpenF1("/v1/sessions", { session_key: key }, token);
     
-    // We retrieve metadata again using the session key just found, 
-    // to include the official names in the response
-    const sessionDetailResponse = await fetchFromOpenF1("/v1/sessions", { session_key: sessionKey });
-    const sessionData = sessionDetailResponse[0];
+    const responsePayload = { status: "Success", session_key: key, openf1_resolved_name: { country: sessionDataArr[0].country_name, session: sessionDataArr[0].session_name }, session_info: sessionDataArr[0] };
+    console.log("[API RESPONSE]\n" + JSON.stringify(responsePayload, null, 2));
 
-    res.json({
-      status: "Success (Dynamic Lookup)",
-      query_params: { year, location, session_type },
-      openf1_resolved_name: {
-        country_name: sessionData.country_name,
-        session_name: sessionData.session_name
-      },
-      session_key: sessionData.session_key,
-      session_info: {
-        meeting_key: sessionData.meeting_key,
-        location: sessionData.location,
-        meeting_name: sessionData.meeting_name,
-        date_start: sessionData.date_start,
-      }
-    });
-
-  } catch (err) {
-    console.error("Error fetching session key via /find_session_key:", err.message);
-    const status = err.response ? err.response.status : 500;
-    res.status(status).json({
-      error: "Session Lookup Failed",
-      message: err.message,
-      hint: "Use fuzzy names like 'Abu Dhabi' or 'Silverstone'.",
-    });
-  }
+    res.json(responsePayload);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
 
 // ============================================
-// 📊 CHART & ANALYSIS POST ROUTES (8 Paths)
-// (All now use the new, dynamic getSessionKey)
+// PRECISE LAP-BY-LAP POSITION (Timing Loop Method)
 // ============================================
+app.get("/position", async (req, res) => {
+    const { year, location, session_type, driver } = req.query;
 
-// 1. /fastest_lap_summary
-app.post("/fastest_lap_summary", async (req, res) => {
-  try {
-    const { year, gp, session_type, driver } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type); 
-    // -------------------------------------
-
-    const url = `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`;
-    const { data: laps } = await axios.get(url);
-
-    let filteredLaps = laps.filter((l) => l.lap_duration !== null);
-
-    if (driver) {
-      const driverUpper = driver.toUpperCase();
-      const driverInfoUrl = `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}&name_acronym=${driverUpper}`;
-      const driverRes = await axios.get(driverInfoUrl);
-
-      if (driverRes.data.length === 0)
-        return res.status(404).json({ detail: "Driver not found" });
-
-      const driverNumber = driverRes.data[0].driver_number;
-      filteredLaps = filteredLaps.filter(
-        (l) => l.driver_number === driverNumber
-      );
+    if (!year || !location || !driver) {
+        return res.status(400).json({ error: "Year, Location, and Driver are required." });
     }
 
-    if (filteredLaps.length === 0)
-      return res.status(404).json({ detail: "No valid laps found." });
-
-    filteredLaps.sort((a, b) => a.lap_duration - b.lap_duration);
-    const fastLap = filteredLaps[0];
-
-    const allLapsUrl = `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`;
-    const allLapsRes = await axios.get(allLapsUrl);
-    const globalFastest = allLapsRes.data
-      .filter((l) => l.lap_duration)
-      .sort((a, b) => a.lap_duration - b.lap_duration)[0];
-
-    const driverDetail = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}&driver_number=${fastLap.driver_number}`
-    );
-    const driverAcronym = driverDetail.data[0]?.name_acronym || "UNK";
-
-    res.json({
-      status: "Success",
-      data_type: "Fastest Lap Summary",
-      driver: driverAcronym,
-      lap_time_seconds: fastLap.lap_duration,
-      lap_number: fastLap.lap_number,
-      compound: "N/A",
-      tyre_age_at_lap_end: 0,
-      session_fastest: fastLap.lap_duration === globalFastest.lap_duration,
-    });
-  } catch (e) {
-    console.error(e);
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 2. /telemetry_chart
-app.post("/telemetry_chart", async (req, res) => {
-  try {
-    const { year, gp, session_type, driver, lap_number } = req.body;
-    if (!driver || !lap_number)
-      return res
-        .status(400)
-        .json({ detail: "Driver and Lap Number required." });
-
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const driverRes = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}&name_acronym=${driver.toUpperCase()}`
-    );
-    if (!driverRes.data.length)
-      return res.status(404).json({ detail: "Driver not found" });
-    const driverNumber = driverRes.data[0].driver_number;
-
-    const lapsRes = await axios.get(
-      `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${driverNumber}&lap_number=${lap_number}`
-    );
-    if (!lapsRes.data.length)
-      return res.status(404).json({ detail: "Lap not found" });
-
-    const lapData = lapsRes.data[0];
-    const startTime = lapData.date_start;
-    const endTime = new Date(
-      new Date(startTime).getTime() + lapData.lap_duration * 1000
-    ).toISOString();
-
-    const carDataUrl = `${OPENF1_BASE}/v1/car_data?session_key=${sessionKey}&driver_number=${driverNumber}&date>=${startTime}&date<=${endTime}`;
-    const { data: telemetry } = await axios.get(carDataUrl);
-
-    const labels = telemetry.map((_, i) => i);
-    const speeds = telemetry.map((t) => t.speed);
-
-    const configuration = {
-      type: "line",
-      data: {
-        labels: labels,
-        datasets: [
-          {
-            label: "Speed (km/h)",
-            data: speeds,
-            borderColor: "red",
-            borderWidth: 1,
-            pointRadius: 0,
-            fill: false,
-          },
-        ],
-      },
-      options: {
-        scales: {
-          y: {
-            beginAtZero: false,
-            title: { display: true, text: "Speed (km/h)" },
-          },
-          x: {
-            display: false,
-            title: { display: true, text: "Distance (approx)" },
-          },
-        },
-        plugins: {
-          title: {
-            display: true,
-            text: `${driver} - Lap ${lap_number} Speed Trace`,
-          },
-          legend: { display: false },
-        },
-      },
-    };
-
-    const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const publicId = `${year}-${gp}-${session_type}-${driver}-lap${lap_number}-speed`;
-    const url = await uploadImageToCloudinary(imageBuffer, publicId);
-
-    res.json({
-      status: "Success",
-      data_type: "Image URL (Speed Trace)",
-      driver: driver,
-      lap_number: lap_number,
-      image_url: url,
-    });
-  } catch (e) {
-    console.error(e);
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 3. /pitstops_chart
-app.post("/pitstops_chart", async (req, res) => {
-  try {
-    const { year, gp, session_type } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const pitsRes = await axios.get(
-      `${OPENF1_BASE}/v1/pit?session_key=${sessionKey}`
-    );
-    const pitStops = pitsRes.data;
-
-    if (pitStops.length === 0)
-      return res.status(404).json({ detail: "No pit stops found" });
-
-    const driversRes = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`
-    );
-    const driverMap = {};
-    driversRes.data.forEach(
-      (d) => (driverMap[d.driver_number] = d.name_acronym)
-    );
-
-    const counts = {};
-    pitStops.forEach((stop) => {
-      const name = driverMap[stop.driver_number] || stop.driver_number;
-      counts[name] = (counts[name] || 0) + 1;
-    });
-
-    const sortedDrivers = Object.keys(counts).sort(
-      (a, b) => counts[b] - counts[a]
-    );
-    const sortedCounts = sortedDrivers.map((d) => counts[d]);
-
-    const configuration = {
-      type: "bar",
-      data: {
-        labels: sortedDrivers,
-        datasets: [
-          {
-            label: "Pit Stops",
-            data: sortedCounts,
-            backgroundColor: "coral",
-          },
-        ],
-      },
-      options: {
-        plugins: {
-          title: { display: true, text: `Total Pit Stops - ${year} ${gp}` },
-        },
-      },
-    };
-
-    const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const publicId = `${year}-${gp}-${session_type}-pit-count`;
-    const url = await uploadImageToCloudinary(imageBuffer, publicId);
-
-    res.json({
-      status: "Success",
-      data_type: "Image URL (Pit Stop Count Chart)",
-      session: `${year} ${gp} ${session_type}`,
-      image_url: url,
-    });
-  } catch (e) {
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 4. /gap_chart
-app.post("/gap_chart", async (req, res) => {
-  try {
-    const { year, gp, session_type } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const { data: allLaps } = await axios.get(
-      `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`
-    );
-    const { data: drivers } = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`
-    );
-
-    const driverMap = {};
-    drivers.forEach((d) => (driverMap[d.driver_number] = d.name_acronym));
-
-    const topDrivers = drivers.slice(0, 5).map((d) => d.driver_number);
-
-    const driverTimes = {};
-
-    allLaps.forEach((lap) => {
-      if (!driverTimes[lap.driver_number]) driverTimes[lap.driver_number] = [];
-      driverTimes[lap.driver_number].push({
-        lap: lap.lap_number,
-        time: lap.lap_duration || 100,
-      });
-    });
-
-    Object.keys(driverTimes).forEach((d) => {
-      driverTimes[d].sort((a, b) => a.lap - b.lap);
-    });
-
-    const cumulative = {};
-    Object.keys(driverTimes).forEach((d) => {
-      cumulative[d] = [];
-      let total = 0;
-      driverTimes[d].forEach((l) => {
-        total += l.time;
-        cumulative[d].push({ lap: l.lap, total });
-      });
-    });
-
-    const referenceDriver = topDrivers[0];
-    if (!cumulative[referenceDriver])
-      return res.status(404).json({ detail: "Data insufficient" });
-
-    const datasets = [];
-
-    topDrivers.forEach((dNum) => {
-      if (!cumulative[dNum]) return;
-      const name = driverMap[dNum];
-      const dataPoints = [];
-
-      cumulative[dNum].forEach((lapData, index) => {
-        if (cumulative[referenceDriver][index]) {
-          const gap = lapData.total - cumulative[referenceDriver][index].total;
-          dataPoints.push(gap);
-        }
-      });
-
-      datasets.push({
-        label: name,
-        data: dataPoints,
-        borderColor: getDriverColor(name),
-        fill: false,
-        pointRadius: 0,
-      });
-    });
-
-    const configuration = {
-      type: "line",
-      data: { labels: cumulative[referenceDriver].map((l) => l.lap), datasets },
-      options: {
-        scales: {
-          y: { reverse: true, title: { display: true, text: "Gap (s)" } },
-        },
-        plugins: {
-          title: { display: true, text: `Gap to Leader - ${year} ${gp}` },
-        },
-      },
-    };
-
-    const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const publicId = `${year}-${gp}-${session_type}-gap-to-leader`;
-    const url = await uploadImageToCloudinary(imageBuffer, publicId);
-
-    res.json({
-      status: "Success",
-      data_type: "Image URL (Gap to Leader Chart)",
-      session: `${year} ${gp} ${session_type}`,
-      image_url: url,
-    });
-  } catch (e) {
-    console.log(e);
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 5. /weather_chart
-app.post("/weather_chart", async (req, res) => {
-  try {
-    const { year, gp, session_type } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const { data: weather } = await axios.get(
-      `${OPENF1_BASE}/v1/weather?session_key=${sessionKey}`
-    );
-
-    if (weather.length === 0)
-      return res.status(404).json({ detail: "No weather data." });
-
-    const labels = weather.map((_, i) => i);
-    const trackTemp = weather.map((w) => w.track_temperature);
-    const airTemp = weather.map((w) => w.air_temperature);
-
-    const configuration = {
-      type: "line",
-      data: {
-        labels: labels,
-        datasets: [
-          {
-            label: "Track Temp",
-            data: trackTemp,
-            borderColor: "red",
-            fill: false,
-            pointRadius: 0,
-          },
-          {
-            label: "Air Temp",
-            data: airTemp,
-            borderColor: "skyblue",
-            fill: false,
-            pointRadius: 0,
-          },
-        ],
-      },
-      options: {
-        plugins: {
-          title: { display: true, text: `Temperatures - ${year} ${gp}` },
-        },
-      },
-    };
-
-    const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const publicId = `${year}-${gp}-${session_type}-temperature-trace`;
-    const url = await uploadImageToCloudinary(imageBuffer, publicId);
-
-    res.json({
-      status: "Success",
-      data_type: "Image URL (Temperature Chart)",
-      session: `${year} ${gp} ${session_type}`,
-      image_url: url,
-    });
-  } catch (e) {
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 6. /telemetry_summary
-app.post("/telemetry_summary", async (req, res) => {
-  try {
-    const { year, gp, session_type, driver, lap_number } = req.body;
-    if (!driver || !lap_number)
-      return res.status(400).json({ detail: "Required fields missing" });
-
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const driverRes = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}&name_acronym=${driver.toUpperCase()}`
-    );
-    if (!driverRes.data.length)
-      return res.status(404).json({ detail: "Driver not found" });
-    const driverNumber = driverRes.data[0].driver_number;
-
-    const lapsRes = await axios.get(
-      `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}&driver_number=${driverNumber}&lap_number=${lap_number}`
-    );
-    const lapData = lapsRes.data[0];
-    const startTime = lapData.date_start;
-    const endTime = new Date(
-      new Date(startTime).getTime() + lapData.lap_duration * 1000
-    ).toISOString();
-
-    const { data: telemetry } = await axios.get(
-      `${OPENF1_BASE}/v1/car_data?session_key=${sessionKey}&driver_number=${driverNumber}&date>=${startTime}&date<=${endTime}`
-    );
-
-    const speeds = telemetry.map((t) => t.speed);
-    const throttles = telemetry.map((t) => t.throttle);
-
-    const maxSpeed = Math.max(...speeds);
-    const avgSpeed = speeds.reduce((a, b) => a + b, 0) / speeds.length;
-    const avgThrottle = throttles.reduce((a, b) => a + b, 0) / throttles.length;
-
-    const brakingPoints = throttles.filter((t) => t < 5).length;
-    const totalPoints = throttles.length;
-    const brakingPercent = (brakingPoints / totalPoints) * 100;
-
-    res.json({
-      status: "Success",
-      data_type: "Telemetry Summary",
-      driver: driver,
-      lap_number: lap_number,
-      summary: {
-        max_speed_kph: parseFloat(maxSpeed.toFixed(1)),
-        avg_speed_kph: parseFloat(avgSpeed.toFixed(1)),
-        braking_percent_of_lap_distance: parseFloat(brakingPercent.toFixed(1)),
-        avg_throttle_percent: parseFloat(avgThrottle.toFixed(1)),
-      },
-    });
-  } catch (e) {
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 7. /pitstops_summary
-app.post("/pitstops_summary", async (req, res) => {
-  try {
-    const { year, gp, session_type } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const { data: pitStops } = await axios.get(
-      `${OPENF1_BASE}/v1/pit?session_key=${sessionKey}`
-    );
-    const { data: drivers } = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`
-    );
-    const driverMap = {};
-    drivers.forEach((d) => (driverMap[d.driver_number] = d.name_acronym));
-
-    const formattedPits = pitStops.map((stop) => ({
-      driver: driverMap[stop.driver_number] || stop.driver_number,
-      lap_number: stop.lap_number,
-      pit_duration_seconds: stop.pit_duration,
-      tyres_fitted: "Unknown",
-    }));
-
-    res.json({
-      status: "Success",
-      data_type: "Pit Stop Summary",
-      pit_stops: formattedPits,
-    });
-  } catch (e) {
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
-});
-
-// 8. /lap_analysis (NEW - Replaces root endpoint)
-app.post("/lap_analysis", async (req, res) => {
-  try {
-    const { year, gp, session_type, driver } = req.body;
-    // --- UPDATED to use dynamic lookup ---
-    const sessionKey = await getSessionKey(year, gp, session_type);
-    // -------------------------------------
-
-    const { data: allLaps } = await axios.get(
-      `${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`
-    );
-    const { data: drivers } = await axios.get(
-      `${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`
-    );
-
-    const driverMap = {};
-    drivers.forEach((d) => (driverMap[d.driver_number] = d.name_acronym));
-
-    // Filter by driver if specified
-    let filteredLaps = allLaps.filter((l) => l.lap_duration !== null);
-    let targetDriverNumber = null;
-
-    if (driver) {
-      const driverUpper = driver.toUpperCase();
-      const driverInfo = drivers.find((d) => d.name_acronym === driverUpper);
-      if (!driverInfo)
-        return res.status(404).json({ detail: "Driver not found" });
-      targetDriverNumber = driverInfo.driver_number;
-      filteredLaps = filteredLaps.filter(
-        (l) => l.driver_number === targetDriverNumber
-      );
-    }
-
-    if (filteredLaps.length === 0)
-      return res.status(404).json({ detail: "No valid laps found" });
-
-    // Calculate stats
-    const sortedLaps = [...filteredLaps].sort(
-      (a, b) => a.lap_duration - b.lap_duration
-    );
-    const fastestLap = sortedLaps[0];
-    const lapTimes = filteredLaps.map((l) => l.lap_duration);
-    const avgLap = lapTimes.reduce((a, b) => a + b, 0) / lapTimes.length;
-    const stdDev = Math.sqrt(
-      lapTimes.reduce((sum, time) => sum + Math.pow(time - avgLap, 2), 0) /
-        lapTimes.length
-    );
-    const consistency = ((1 - stdDev / avgLap) * 100).toFixed(1);
-
-    // Prepare chart data - lap progression for top 5 or single driver
-    let chartDrivers = [];
-    if (driver) {
-      chartDrivers = [targetDriverNumber];
-    } else {
-      const driverLapCounts = {};
-      allLaps.forEach((l) => {
-        driverLapCounts[l.driver_number] =
-          (driverLapCounts[l.driver_number] || 0) + 1;
-      });
-      chartDrivers = Object.keys(driverLapCounts)
-        .sort((a, b) => driverLapCounts[b] - driverLapCounts[a])
-        .slice(0, 5)
-        .map((d) => parseInt(d));
-    }
-
-    const datasets = [];
-    chartDrivers.forEach((dNum) => {
-      const driverLaps = allLaps
-        .filter((l) => l.driver_number === dNum && l.lap_duration)
-        .sort((a, b) => a.lap_number - b.lap_number);
-
-      if (driverLaps.length > 0) {
-        datasets.push({
-          label: driverMap[dNum] || dNum,
-          data: driverLaps.map((l) => l.lap_duration),
-          borderColor: getDriverColor(driverMap[dNum]),
-          fill: false,
-          pointRadius: 1,
+    try {
+        const token = await resolveTokenFromRequest(req);
+
+        // 1. Resolve Session
+        const sessionKey = await getSessionKey(year, location, session_type, token);
+
+        // 2. Resolve Target Driver Number
+        const { data: driversList } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        const needle = driver.toString().toLowerCase().trim();
+        const targetDriver = driversList.find(d => 
+            (d.name_acronym && d.name_acronym.toLowerCase() === needle) ||
+            (d.driver_number && d.driver_number.toString() === needle) ||
+            (d.last_name && d.last_name.toLowerCase().includes(needle))
+        );
+
+        if (!targetDriver) return res.status(404).json({ error: `Driver '${driver}' not found.` });
+        const targetNum = targetDriver.driver_number;
+
+        // 3. Fetch ALL Laps for the Session (To compare timing)
+        // We need everyone's laps to calculate rank
+        const { data: allLaps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+
+        // 4. Build Timing Map
+        // Key: "LapNumber", Value: Array of { driver_number, finish_time_ms }
+        const leaderboardMap = {};
+
+        allLaps.forEach(l => {
+            if (!l.lap_duration || !l.date_start) return;
+            
+            // Calculate exact finish time of the lap in milliseconds
+            const finishTime = new Date(l.date_start).getTime() + (l.lap_duration * 1000);
+            
+            if (!leaderboardMap[l.lap_number]) leaderboardMap[l.lap_number] = [];
+            leaderboardMap[l.lap_number].push({
+                driver: l.driver_number,
+                time: finishTime
+            });
         });
-      }
-    });
 
-    const maxLaps = Math.max(...datasets.map((d) => d.data.length));
-    const labels = Array.from({ length: maxLaps }, (_, i) => i + 1);
+        // 5. Extract History for Target Driver
+        const history = [];
+        const driverLaps = allLaps.filter(l => l.driver_number === targetNum).sort((a, b) => a.lap_number - b.lap_number);
 
-    const configuration = {
-      type: "line",
-      data: { labels, datasets },
-      options: {
-        scales: {
-          y: {
-            beginAtZero: false,
-            title: { display: true, text: "Lap Time (s)" },
-          },
-          x: { title: { display: true, text: "Lap Number" } },
-        },
-        plugins: {
-          title: {
-            display: true,
-            text: driver
-              ? `${driver} Lap Progression - ${year} ${gp}`
-              : `Lap Progression - ${year} ${gp}`,
-          },
-        },
-      },
-    };
+        driverLaps.forEach(myLap => {
+            const lapNum = myLap.lap_number;
+            const opponents = leaderboardMap[lapNum];
 
-    const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const publicId = `${year}-${gp}-${session_type}-${
-      driver || "all"
-    }-lap-progression`;
-    const chartUrl = await uploadImageToCloudinary(imageBuffer, publicId);
+            if (opponents) {
+                // Sort all drivers by who finished this lap first (Low time = Better pos)
+                opponents.sort((a, b) => a.time - b.time);
 
-    res.json({
-      status: "Success",
-      data_type: "Lap Analysis",
-      session: `${year} ${gp} ${mapSessionType(session_type)}`,
-      summary: {
-        total_laps: filteredLaps.length,
-        fastest_lap: {
-          driver: driverMap[fastestLap.driver_number],
-          time_seconds: parseFloat(fastestLap.lap_duration.toFixed(3)),
-          lap_number: fastestLap.lap_number,
-        },
-        average_lap_time: parseFloat(avgLap.toFixed(3)),
-        consistency_percent: parseFloat(consistency),
-        std_deviation: parseFloat(stdDev.toFixed(3)),
-      },
-      chart_url: chartUrl,
-    });
-  } catch (e) {
-    console.error(e);
-    // Use proper status code if available
-    const status = e.response ? e.response.status : 500;
-    res.status(status).json({ detail: e.message });
-  }
+                // Find my index (0-based) and add 1 for position
+                const myRank = opponents.findIndex(o => o.driver === targetNum);
+                
+                if (myRank !== -1) {
+                    history.push({
+                        lap: lapNum,
+                        position: myRank + 1
+                    });
+                }
+            }
+        });
+
+        // 6. Send Result
+        res.json({
+            driver: targetDriver.name_acronym,
+            history: history
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// ============================================
-// START SERVER
-// ============================================
 
-app.listen(PORT, () => {
-  console.log(`🏁 Consolidated F1 Server running at http://localhost:${PORT}`);
-  console.log(`TOTAL ENDPOINTS: 11 (8 POST, 2 GET, 1 NEW Dynamic GET)`);
+// NEW ENDPOINT: /driver-info
+app.get("/driver-info", async (req, res) => {
+    const { year, location, session_type, driver } = req.query;
+    
+    if (!year || !location || !driver) {
+        return res.status(400).json({ error: "Missing required parameters: year, location, and driver." });
+    }
+
+    try {
+        const token = await resolveTokenFromRequest(req);
+        
+        // 1. Resolve Session Key
+        const sessionKey = await getSessionKey(year, location, session_type, token);
+        
+        // 2. Resolve Driver Number
+        const driverNumber = await resolveDriverNumber(sessionKey, driver, token);
+
+        if (!driverNumber) {
+            return res.status(404).json({ error: `Driver '${driver}' not found in the resolved session.` });
+        }
+        
+        // 3. Fetch Full Driver Profile
+        const driverProfileArr = await fetchFromOpenF1("/v1/drivers", { session_key: sessionKey, driver_number: driverNumber }, token);
+        const driverProfile = driverProfileArr[0];
+
+        const responsePayload = {
+            status: "Success",
+            resolved_driver: {
+                driver_number: driverProfile.driver_number,
+                name_acronym: driverProfile.name_acronym,
+                full_name: driverProfile.full_name,
+                team_name: driverProfile.team_name,
+                session_key: sessionKey
+            },
+            full_profile: driverProfile
+        };
+        
+        console.log("[API RESPONSE]\n" + JSON.stringify(responsePayload, null, 2));
+
+        res.json(responsePayload);
+    } catch (e) {
+        console.error(`[DriverInfo Error] ${e.message}`);
+        res.status(500).json({ error: e.message });
+    }
 });
+
+app.get("/drivers", async (req, res) => {
+    try {
+        const token = await resolveTokenFromRequest(req);
+        const drivers = await fetchFromOpenF1("/v1/drivers", {}, token);
+        
+        const responsePayload = drivers.slice(0, 20);
+        console.log(`[API RESPONSE] Drivers List: ${responsePayload.length} items`);
+        
+        res.json(responsePayload);
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+function formatDuration(seconds) {
+    if (!seconds) return "N/A";
+    const mins = Math.floor(seconds / 60);
+    const secs = (seconds % 60).toFixed(3);
+    return `${mins}:${secs.padStart(6, '0')}`;
+}
+
+app.listen(PORT, () => console.log(`🏁 Consolidated F1 Server (Authenticated & Date-Aware) running at http://localhost:${PORT}`));
