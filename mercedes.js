@@ -873,30 +873,30 @@ app.get("/find_session_key", async (req, res) => {
 // ============================================
 // 🏁 SMART POSITION ENDPOINT (Leaderboard or History)
 // ============================================
+// ============================================
+// 🏁 SMART POSITION ENDPOINT (Leaderboard or History)
+// ============================================
 app.get("/position", async (req, res) => {
     const year = req.query.year || DEMO_DEFAULTS.YEAR;
     const session_type = req.query.session_type || DEMO_DEFAULTS.SESSION_TYPE;
     let location = req.query.location;
     const driver = req.query.driver;
 
-    // 1. FIX: Handle AI generic "current" input
-    // If agent says "current", we set location to null so Global Search finds the latest race (Vegas)
+    // FIX: Clear "current" to trigger Global Search
     if (location && location.toLowerCase() === "current") location = null;
 
     try {
         const token = await resolveTokenFromRequest(req);
-        
-        // 2. Resolve Session (Uses your Bulletproof logic)
         const sessionKey = await getSessionKey(year, location, session_type, token);
         
         // ==================================================
-        // SCENARIO A: SPECIFIC DRIVER HISTORY (If driver provided)
+        // SCENARIO A: SPECIFIC DRIVER HISTORY (Keep your original logic)
         // ==================================================
         if (driver) {
             const dNum = await resolveDriverNumber(sessionKey, driver, token);
-            // If driver not found, return 404 ONLY in this scenario
-            if (!dNum) return res.status(404).json({ error: `Driver '${driver}' not found in session ${sessionKey}.` });
+            if (!dNum) return res.status(404).json({ error: `Driver '${driver}' not found.` });
 
+            // Fetch lap history for charts
             const { data: allLaps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
             
             const leaderboardMap = {};
@@ -917,43 +917,46 @@ app.get("/position", async (req, res) => {
                 }
             });
             
-            return res.json({ 
-                type: "Driver History",
-                driver: driver, 
-                driver_number: dNum,
-                history 
-            });
+            return res.json({ type: "Driver History", driver, driver_number: dNum, history });
         }
 
         // ==================================================
-        // SCENARIO B: FULL LEADERBOARD (No driver provided)
+        // SCENARIO B: LIVE LEADERBOARD (The Fix)
         // ==================================================
-        // This handles "Who is leading?"
         
-        // 1. Try Session Results
+        // 1. Try Official Results first (Best for Post-Race)
         let { data: results } = await axios.get(`${OPENF1_BASE}/v1/session_result?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
         
-        // 2. If empty (Live Race), use Live Position data
+        // 2. If empty (Race is Live), use '/intervals' (Gaps) instead of '/position' (GPS)
         if (!results || results.length === 0) {
-            const { data: livePos } = await axios.get(`${OPENF1_BASE}/v1/position?session_key=${sessionKey}&date=>${new Date(Date.now() - 60000).toISOString()}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            // Fetch intervals from last 60 seconds
+            const { data: liveIntervals } = await axios.get(`${OPENF1_BASE}/v1/intervals?session_key=${sessionKey}&date=>${new Date(Date.now() - 60000).toISOString()}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
             
-            if (livePos && livePos.length > 0) {
-                const latestPositions = {};
-                livePos.forEach(p => {
-                    if (!latestPositions[p.driver_number] || new Date(p.date) > new Date(latestPositions[p.driver_number].date)) {
-                        latestPositions[p.driver_number] = p;
+            if (liveIntervals && liveIntervals.length > 0) {
+                // Deduplicate: Get latest gap for each driver
+                const latestGaps = {};
+                liveIntervals.forEach(i => {
+                    if (!latestGaps[i.driver_number] || new Date(i.date) > new Date(latestGaps[i.driver_number].date)) {
+                        latestGaps[i.driver_number] = i;
                     }
                 });
-                results = Object.values(latestPositions).sort((a, b) => a.position - b.position).map(p => ({
-                    position: p.position,
+
+                // Sort by Gap to Leader (Ascending). Leader has gap=0 or null.
+                results = Object.values(latestGaps).sort((a, b) => {
+                    const gapA = parseFloat(a.gap_to_leader) || 0; // Treat null as 0 (Leader)
+                    const gapB = parseFloat(b.gap_to_leader) || 0;
+                    return gapA - gapB;
+                }).map((p, index) => ({
+                    position: index + 1, // Assign Rank based on sorted gap
                     driver_number: p.driver_number,
+                    gap: p.gap_to_leader,
                     status: "On Track"
                 }));
             }
         }
 
-        // 3. Enrich with Driver Names
-        if (results.length > 0) {
+        // 3. Enrich & Return
+        if (results && results.length > 0) {
             const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
             const dMap = {}; 
             drivers.forEach(d => dMap[d.driver_number] = d.name_acronym || d.last_name);
@@ -961,7 +964,7 @@ app.get("/position", async (req, res) => {
             const leaderboard = results.slice(0, 10).map(r => ({
                 position: r.position,
                 driver: dMap[r.driver_number] || `#${r.driver_number}`,
-                gap: r.time || r.gap_to_leader || "Interval"
+                gap: r.gap || r.time || "Interval"
             }));
 
             return res.json({
@@ -972,7 +975,7 @@ app.get("/position", async (req, res) => {
             });
         }
 
-        return res.json({ message: "No position data available yet.", session_key: sessionKey });
+        return res.json({ message: "No live leaderboard data available yet.", session_key: sessionKey });
 
     } catch (e) { 
         console.error(`[Position Error] ${e.message}`);
