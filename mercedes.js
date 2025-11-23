@@ -861,36 +861,128 @@ app.get("/find_session_key", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+
+
+// ============================================
+// 🏁 SMART POSITION ENDPOINT (Leaderboard or History)
+// ============================================
+// ============================================
+// 🏁 SMART POSITION ENDPOINT (Leaderboard or History)
+// ============================================
+// ============================================
+// 🏁 SMART POSITION ENDPOINT (Leaderboard or History)
+// ============================================
 app.get("/position", async (req, res) => {
-    const { year, location, session_type, driver } = req.query;
-    if (!year || !location || !driver) return res.status(400).json({ error: "Year, Location, and Driver are required." });
+    const year = req.query.year || DEMO_DEFAULTS.YEAR;
+    const session_type = req.query.session_type || DEMO_DEFAULTS.SESSION_TYPE;
+    let location = req.query.location;
+    const driver = req.query.driver;
+
+    // 1. FIX: Handle AI generic "current" input
+    // If agent says "current", we set location to null so Global Search finds the latest race (Vegas)
+    if (location && location.toLowerCase() === "current") location = null;
 
     try {
         const token = await resolveTokenFromRequest(req);
+        
+        // 2. Resolve Session (Uses your Bulletproof logic)
         const sessionKey = await getSessionKey(year, location, session_type, token);
-        const dNum = await resolveDriverNumber(sessionKey, driver, token);
-        if (!dNum) return res.status(404).json({ error: `Driver not found.` });
+        
+        // ==================================================
+        // SCENARIO A: SPECIFIC DRIVER HISTORY (If driver provided)
+        // ==================================================
+        if (driver) {
+            const dNum = await resolveDriverNumber(sessionKey, driver, token);
+            // If driver not found, return 404 ONLY in this scenario
+            if (!dNum) return res.status(404).json({ error: `Driver '${driver}' not found in session ${sessionKey}.` });
 
-        const { data: allLaps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
-        const leaderboardMap = {};
-        allLaps.forEach(l => {
-            if (!l.lap_duration) return;
-            const time = new Date(l.date_start).getTime() + l.lap_duration*1000;
-            if(!leaderboardMap[l.lap_number]) leaderboardMap[l.lap_number] = [];
-            leaderboardMap[l.lap_number].push({ driver: l.driver_number, time });
-        });
-        const history = [];
-        allLaps.filter(l => l.driver_number === dNum).forEach(l => {
-            const ops = leaderboardMap[l.lap_number];
-            if(ops) {
-                ops.sort((a,b) => a.time - b.time);
-                const rank = ops.findIndex(o => o.driver === dNum);
-                if(rank !== -1) history.push({ lap: l.lap_number, position: rank+1 });
+            const { data: allLaps } = await axios.get(`${OPENF1_BASE}/v1/laps?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            
+            const leaderboardMap = {};
+            allLaps.forEach(l => {
+                if (!l.lap_duration) return;
+                const time = new Date(l.date_start).getTime() + l.lap_duration*1000;
+                if(!leaderboardMap[l.lap_number]) leaderboardMap[l.lap_number] = [];
+                leaderboardMap[l.lap_number].push({ driver: l.driver_number, time });
+            });
+
+            const history = [];
+            allLaps.filter(l => l.driver_number === dNum).forEach(l => {
+                const ops = leaderboardMap[l.lap_number];
+                if(ops) {
+                    ops.sort((a,b) => a.time - b.time);
+                    const rank = ops.findIndex(o => o.driver === dNum);
+                    if(rank !== -1) history.push({ lap: l.lap_number, position: rank+1 });
+                }
+            });
+            
+            return res.json({ 
+                type: "Driver History",
+                driver: driver, 
+                driver_number: dNum,
+                history 
+            });
+        }
+
+        // ==================================================
+        // SCENARIO B: FULL LEADERBOARD (No driver provided)
+        // ==================================================
+        // This handles "Who is leading?"
+        
+        // 1. Try Session Results
+        let { data: results } = await axios.get(`${OPENF1_BASE}/v1/session_result?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+        
+        // 2. If empty (Live Race), use Live Position data
+        if (!results || results.length === 0) {
+            const { data: livePos } = await axios.get(`${OPENF1_BASE}/v1/position?session_key=${sessionKey}&date=>${new Date(Date.now() - 60000).toISOString()}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            
+            if (livePos && livePos.length > 0) {
+                const latestPositions = {};
+                livePos.forEach(p => {
+                    if (!latestPositions[p.driver_number] || new Date(p.date) > new Date(latestPositions[p.driver_number].date)) {
+                        latestPositions[p.driver_number] = p;
+                    }
+                });
+                results = Object.values(latestPositions).sort((a, b) => a.position - b.position).map(p => ({
+                    position: p.position,
+                    driver_number: p.driver_number,
+                    status: "On Track"
+                }));
             }
-        });
-        res.json({ driver: req.query.driver, history });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        }
+
+        // 3. Enrich with Driver Names
+        if (results.length > 0) {
+            const { data: drivers } = await axios.get(`${OPENF1_BASE}/v1/drivers?session_key=${sessionKey}`, { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+            const dMap = {}; 
+            drivers.forEach(d => dMap[d.driver_number] = d.name_acronym || d.last_name);
+            
+            const leaderboard = results.slice(0, 10).map(r => ({
+                position: r.position,
+                driver: dMap[r.driver_number] || `#${r.driver_number}`,
+                gap: r.time || r.gap_to_leader || "Interval"
+            }));
+
+            return res.json({
+                type: "Current Leaderboard",
+                session_key: sessionKey,
+                leader: leaderboard[0]?.driver || "Unknown",
+                top_10: leaderboard
+            });
+        }
+
+        return res.json({ message: "No position data available yet.", session_key: sessionKey });
+
+    } catch (e) { 
+        console.error(`[Position Error] ${e.message}`);
+        res.status(500).json({ error: e.message }); 
+    }
 });
+
+
+
+
 
 app.get("/driver-info", async (req, res) => {
     const { year, location, session_type, driver } = req.query;
